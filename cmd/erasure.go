@@ -377,7 +377,17 @@ func (er erasureObjects) cleanupDeletedObjects(ctx context.Context) {
 
 // nsScanner will start scanning buckets and send updated totals as they are traversed.
 // Updates are sent on a regular basis and the caller *must* consume them.
-func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wantCycle uint32, updates chan<- dataUsageCache, healScanMode madmin.HealScanMode) error {
+func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wantCycle uint32, updates chan<- dataUsageCache, healScanMode madmin.HealScanMode, sched *bucketScanScheduler) error {
+	if sched != nil && sched.enabled() {
+		return er.nsScannerScheduled(ctx, buckets, wantCycle, updates, healScanMode, sched)
+	}
+	return er.nsScannerLegacy(ctx, buckets, wantCycle, updates, healScanMode)
+}
+
+// nsScannerLegacy scans every bucket once in random order, whole bucket at
+// a time. It is used whenever no per-bucket scheduling configuration is
+// present, preserving the historical scanner behavior exactly.
+func (er erasureObjects) nsScannerLegacy(ctx context.Context, buckets []BucketInfo, wantCycle uint32, updates chan<- dataUsageCache, healScanMode madmin.HealScanMode) error {
 	if len(buckets) == 0 {
 		return nil
 	}
@@ -561,6 +571,237 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 
 				// Save cache
 				scannerLogIf(ctx, cache.save(ctx, er, cacheName))
+			}
+		}(i)
+	}
+	wg.Wait()
+	xioutil.SafeClose(bucketResults)
+	saverWg.Wait()
+
+	return nil
+}
+
+// nsScannerScheduled drives the scan through the per-bucket scheduler.
+// Each disk worker asks the scheduler for the next budgeted bucket turn;
+// yielded turns save their partial cache and re-enter rotation, so a big
+// bucket can no longer hold a worker for the whole cycle and paused
+// buckets keep their position.
+func (er erasureObjects) nsScannerScheduled(ctx context.Context, buckets []BucketInfo, wantCycle uint32, updates chan<- dataUsageCache, healScanMode madmin.HealScanMode, sched *bucketScanScheduler) error {
+	// Every set reports readiness exactly once so the scheduler barrier
+	// opens even when a set has no buckets or no usable disks.
+	ready := false
+	markReady := func() {
+		if !ready {
+			ready = true
+			sched.setReady()
+		}
+	}
+	if len(buckets) == 0 {
+		sched.registerWorkers(0)
+		markReady()
+		return nil
+	}
+
+	// Collect disks we can use.
+	disks, healing := er.getOnlineDisksWithHealing(false)
+	if len(disks) == 0 {
+		scannerLogIf(ctx, errors.New("data-scanner: all drives are offline or being healed, skipping scanner cycle"))
+		sched.registerWorkers(0)
+		markReady()
+		return nil
+	}
+
+	// Restrict parallelism for disk usage scanner
+	// upto GOMAXPROCS if GOMAXPROCS is < len(disks)
+	maxProcs := runtime.GOMAXPROCS(0)
+	if maxProcs < len(disks) {
+		disks = disks[:maxProcs]
+	}
+
+	// Register workers and wait until every set has done the same.
+	workerBase := sched.registerWorkers(len(disks))
+	markReady()
+	if !sched.waitBarrier(ctx) {
+		return ctx.Err()
+	}
+
+	// Load bucket totals
+	oldCache := dataUsageCache{}
+	if err := oldCache.load(ctx, er, dataUsageCacheName); err != nil {
+		return err
+	}
+
+	// New cache..
+	cache := dataUsageCache{
+		Info: dataUsageCacheInfo{
+			Name:      dataUsageRoot,
+			NextCycle: oldCache.Info.NextCycle,
+		},
+		Cache: make(map[string]dataUsageEntry, len(oldCache.Cache)),
+	}
+	// Pre-populate the buckets known from the previous cycle so their
+	// reported usage stays stable until they are rescanned.
+	for _, b := range buckets {
+		if e := oldCache.find(b.Name); e != nil {
+			cache.replace(b.Name, dataUsageRoot, *e)
+		}
+	}
+
+	bucketResults := make(chan dataUsageEntryInfo, len(disks))
+
+	// Start async collector/saver.
+	// This goroutine owns the cache.
+	var saverWg sync.WaitGroup
+	saverWg.Add(1)
+	go func() {
+		// Add jitter to the update time so multiple sets don't sync up.
+		updateTime := 30*time.Second + time.Duration(float64(10*time.Second)*rand.Float64())
+		t := time.NewTicker(updateTime)
+		defer t.Stop()
+		defer saverWg.Done()
+		var lastSave time.Time
+
+		for {
+			select {
+			case <-t.C:
+				if cache.Info.LastUpdate.Equal(lastSave) {
+					continue
+				}
+				scannerLogOnceIf(ctx, cache.save(ctx, er, dataUsageCacheName), "nsscanner-cache-update")
+				updates <- cache.clone()
+
+				lastSave = cache.Info.LastUpdate
+			case v, ok := <-bucketResults:
+				if !ok {
+					// Save final state...
+					cache.Info.NextCycle = wantCycle
+					cache.Info.LastUpdate = time.Now()
+					scannerLogOnceIf(ctx, cache.save(ctx, er, dataUsageCacheName), "nsscanner-channel-closed")
+					updates <- cache.clone()
+					return
+				}
+				cache.replace(v.Name, v.Parent, v.Entry)
+				cache.Info.LastUpdate = time.Now()
+			}
+		}
+	}()
+
+	// Start one scanner per disk.
+	var wg sync.WaitGroup
+	wg.Add(len(disks))
+
+	for i := range disks {
+		go func(i int) {
+			defer wg.Done()
+			disk := disks[i]
+			workerID := workerBase + i
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				turn, ok := sched.acquire(ctx, workerID)
+				if !ok {
+					return
+				}
+
+				// Load cache for the bucket; a yielded turn saved a
+				// partial cache which is resumed here.
+				cacheName := pathJoin(turn.Bucket, dataUsageCacheName)
+				bucketCache := dataUsageCache{}
+				scannerLogIf(ctx, bucketCache.load(ctx, er, cacheName))
+				if bucketCache.Info.Name == "" {
+					bucketCache.Info.Name = turn.Bucket
+				}
+				bucketCache.Info.SkipHealing = healing
+				bucketCache.Info.NextCycle = wantCycle
+				if bucketCache.Info.Name != turn.Bucket {
+					bucketCache.Info = dataUsageCacheInfo{
+						Name:       turn.Bucket,
+						LastUpdate: time.Time{},
+						NextCycle:  wantCycle,
+					}
+				}
+
+				// Collect updates.
+				entryUpdates := make(chan dataUsageEntry, 1)
+				var entryWg sync.WaitGroup
+				entryWg.Add(1)
+				go func(name string) {
+					defer entryWg.Done()
+					for update := range entryUpdates {
+						select {
+						case <-ctx.Done():
+						case bucketResults <- dataUsageEntryInfo{
+							Name:   name,
+							Parent: dataUsageRoot,
+							Entry:  update,
+						}:
+						}
+					}
+				}(bucketCache.Info.Name)
+
+				// Calc usage within the turn budget.
+				before := bucketCache.Info.LastUpdate
+				turnCtx := contextWithBucketScanTurn(ctx, turn)
+				var err error
+				bucketCache, err = disk.NSScanner(turnCtx, bucketCache, entryUpdates, healScanMode, nil)
+				yielded := errors.Is(err, errBucketScanTurnYielded)
+				if err != nil && !yielded {
+					if !bucketCache.Info.LastUpdate.IsZero() && bucketCache.Info.LastUpdate.After(before) {
+						scannerLogIf(ctx, bucketCache.save(ctx, er, cacheName))
+					} else {
+						scannerLogIf(ctx, err)
+					}
+					entryWg.Wait()
+					// A single bad bucket must not stop the round;
+					// record it as done for this cycle.
+					sched.finish(ctx, bucketTurnResult{
+						workerID: workerID,
+						bucket:   turn.Bucket,
+						err:      err,
+					})
+					continue
+				}
+
+				entryWg.Wait()
+
+				res := bucketTurnResult{
+					workerID: workerID,
+					bucket:   turn.Bucket,
+					yielded:  yielded,
+					reason:   turn.yieldReason(),
+					position: turn.currentPath(),
+					objects:  turn.objects.Load(),
+				}
+				if yielded {
+					// Persist partial progress; the bucket stays in
+					// rotation and resumes from this cache.
+					scannerLogIf(ctx, bucketCache.save(ctx, er, cacheName))
+				} else {
+					// Flatten for upstream, but save full state.
+					var root dataUsageEntry
+					if r := bucketCache.root(); r != nil {
+						root = bucketCache.flatten(*r)
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case bucketResults <- dataUsageEntryInfo{
+						Name:   bucketCache.Info.Name,
+						Parent: dataUsageRoot,
+						Entry:  root,
+					}:
+					}
+
+					// Save cache
+					scannerLogIf(ctx, bucketCache.save(ctx, er, cacheName))
+				}
+
+				sched.finish(ctx, res)
 			}
 		}(i)
 	}

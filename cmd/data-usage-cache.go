@@ -68,6 +68,12 @@ type dataUsageEntry struct {
 	ObjVersions   versionsHistogram `msg:"vh"`
 	AllTierStats  *allTierStats     `msg:"ats,omitempty"`
 	Compacted     bool              `msg:"c"`
+	// ScannedCycle, when equal to dataUsageCacheInfo.NextCycle, marks the
+	// subtree rooted at this entry as fully scanned in the current cycle.
+	// A resumed (yielded) bucket scan transfers such entries without
+	// walking the on-disk subtree again. Zero means the subtree has not
+	// been scanned in the current cycle.
+	ScannedCycle uint32 `msg:"scc,omitempty"`
 }
 
 // allTierStats is a collection of per-tier stats across all configured remote
@@ -835,6 +841,44 @@ func (d *dataUsageCache) clone() dataUsageCache {
 		clone.Cache[k] = v.clone()
 	}
 	return clone
+}
+
+// yieldMerge produces a cache that can resume a bucket scan that ended
+// early (turn budget exhausted or bucket paused). Entries that were
+// fully scanned during the yielded turn (ScannedCycle matches the cache
+// cycle) overlay the previous cache; everything not reached is retained
+// from the previous cache, so no completed interval is lost or rescanned
+// and usage totals for unscanned parts are preserved.
+func (d *dataUsageCache) yieldMerge(partial dataUsageCache) dataUsageCache {
+	res := d.clone()
+	cycle := d.Info.NextCycle
+
+	for k, v := range partial.Cache {
+		if cycle != 0 && v.ScannedCycle == cycle {
+			res.Cache[k] = v.clone()
+		}
+	}
+
+	// Attach fully scanned top-level folders to the bucket root, then
+	// recompute the root totals from the merged tree.
+	rh := hashPath(d.Info.Name)
+	if pr := partial.find(d.Info.Name); pr != nil {
+		root := res.Cache[rh.Key()]
+		for ch := range pr.Children {
+			if _, ok := res.Cache[ch]; ok {
+				root.addChild(dataUsageHash(ch))
+			}
+		}
+		res.Cache[rh.Key()] = root
+	}
+	if flat := res.sizeRecursive(d.Info.Name); flat != nil {
+		// The bucket itself is only fully done once a turn scans it all.
+		flat.ScannedCycle = 0
+		res.replaceHashed(rh, nil, *flat)
+	}
+	res.Info.LastUpdate = UTCNow()
+	res.Info.NextCycle = cycle
+	return res
 }
 
 // merge root of other into d.

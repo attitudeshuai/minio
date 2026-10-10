@@ -327,6 +327,19 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-bucket-quota").HandlerFunc(
 			adminMiddleware(adminAPI.PutBucketQuotaConfigHandler)).Queries("bucket", "{bucket:.*}")
 
+		// Per-bucket data scanner scheduling (weight/budget/pause/resume).
+		// GetBucketScannerConfigHandler - bucket progress and configuration.
+		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/get-bucket-scanner").HandlerFunc(
+			adminMiddleware(adminAPI.GetBucketScannerConfigHandler)).Queries("bucket", "{bucket:.*}")
+		// PutBucketScannerConfigHandler - set weight/budget.
+		adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-bucket-scanner").HandlerFunc(
+			adminMiddleware(adminAPI.PutBucketScannerConfigHandler)).Queries("bucket", "{bucket:.*}")
+		// PauseBucketScannerHandler / ResumeBucketScannerHandler.
+		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/pause-bucket-scanner").HandlerFunc(
+			adminMiddleware(adminAPI.PauseBucketScannerHandler)).Queries("bucket", "{bucket:.*}")
+		adminRouter.Methods(http.MethodPost).Path(adminVersion+"/resume-bucket-scanner").HandlerFunc(
+			adminMiddleware(adminAPI.ResumeBucketScannerHandler)).Queries("bucket", "{bucket:.*}")
+
 		// Bucket replication operations
 		// GetBucketTargetHandler
 		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/list-remote-targets").HandlerFunc(

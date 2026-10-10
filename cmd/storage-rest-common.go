@@ -78,9 +78,17 @@ type nsScannerOptions struct {
 	DiskID   string          `msg:"id"`
 	ScanMode int             `msg:"m"`
 	Cache    *dataUsageCache `msg:"c"`
+	// TurnBudgetNs is the wall-clock budget of this scanner turn in
+	// nanoseconds; 0 means the whole bucket is scanned in one turn.
+	TurnBudgetNs int64 `msg:"tb"`
+	// TurnPaused is a point-in-time snapshot of the bucket pause state.
+	TurnPaused bool `msg:"tp"`
 }
 
 type nsScannerResp struct {
 	Update *dataUsageEntry `msg:"u"`
 	Final  *dataUsageCache `msg:"f"`
+	// Yielded is set when Final contains a partial cache because the
+	// scanner turn ended (budget exhausted or bucket paused).
+	Yielded bool `msg:"y"`
 }

@@ -724,6 +724,12 @@ func (s *xlStorage) NSScanner(ctx context.Context, cache dataUsageCache, updates
 		return sizeS, nil
 	}, scanMode, weSleep)
 	if err != nil {
+		if errors.Is(err, errBucketScanTurnYielded) {
+			// Preserve completed intervals and return the partial cache
+			// together with the yield sentinel; the scheduler will save
+			// it and hand the bucket out again later.
+			return cache.yieldMerge(dataUsageInfo), err
+		}
 		return dataUsageInfo, err
 	}
 

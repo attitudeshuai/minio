@@ -242,15 +242,27 @@ func (client *storageRESTClient) Healing() *healingTracker {
 func (client *storageRESTClient) NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry, scanMode madmin.HealScanMode, _ func() bool) (dataUsageCache, error) {
 	defer xioutil.SafeClose(updates)
 
-	st, err := storageNSScannerRPC.Call(ctx, client.gridConn, &nsScannerOptions{
+	opts := &nsScannerOptions{
 		DiskID:   *client.diskID.Load(),
 		ScanMode: int(scanMode),
 		Cache:    &cache,
-	})
+	}
+	// Forward the scheduler turn budget so remote drives also rotate
+	// instead of holding the scanner for the whole bucket.
+	if t := bucketScanTurnFromContext(ctx); t != nil {
+		if b := t.turnBudget(); b > 0 {
+			opts.TurnBudgetNs = int64(b)
+		}
+		if t.paused != nil {
+			opts.TurnPaused = t.paused()
+		}
+	}
+	st, err := storageNSScannerRPC.Call(ctx, client.gridConn, opts)
 	if err != nil {
 		return cache, toStorageErr(err)
 	}
 	var final *dataUsageCache
+	var yielded bool
 	err = st.Results(func(resp *nsScannerResp) error {
 		if resp.Update != nil {
 			select {
@@ -260,6 +272,7 @@ func (client *storageRESTClient) NSScanner(ctx context.Context, cache dataUsageC
 		}
 		if resp.Final != nil {
 			final = resp.Final
+			yielded = resp.Yielded
 		}
 		// We can't reuse the response since it is sent upstream.
 		return nil
@@ -269,6 +282,9 @@ func (client *storageRESTClient) NSScanner(ctx context.Context, cache dataUsageC
 	}
 	if final == nil {
 		return cache, errors.New("no final cache")
+	}
+	if yielded {
+		return *final, errBucketScanTurnYielded
 	}
 	return *final, nil
 }

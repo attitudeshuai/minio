@@ -54,6 +54,18 @@ func (z *nsScannerOptions) DecodeMsg(dc *msgp.Reader) (err error) {
 					return
 				}
 			}
+		case "tb":
+			z.TurnBudgetNs, err = dc.ReadInt64()
+			if err != nil {
+				err = msgp.WrapError(err, "TurnBudgetNs")
+				return
+			}
+		case "tp":
+			z.TurnPaused, err = dc.ReadBool()
+			if err != nil {
+				err = msgp.WrapError(err, "TurnPaused")
+				return
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -67,9 +79,9 @@ func (z *nsScannerOptions) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *nsScannerOptions) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 3
+	// map header, size 5
 	// write "id"
-	err = en.Append(0x83, 0xa2, 0x69, 0x64)
+	err = en.Append(0x85, 0xa2, 0x69, 0x64)
 	if err != nil {
 		return
 	}
@@ -105,15 +117,35 @@ func (z *nsScannerOptions) EncodeMsg(en *msgp.Writer) (err error) {
 			return
 		}
 	}
+	// write "tb"
+	err = en.Append(0xa2, 0x74, 0x62)
+	if err != nil {
+		return
+	}
+	err = en.WriteInt64(z.TurnBudgetNs)
+	if err != nil {
+		err = msgp.WrapError(err, "TurnBudgetNs")
+		return
+	}
+	// write "tp"
+	err = en.Append(0xa2, 0x74, 0x70)
+	if err != nil {
+		return
+	}
+	err = en.WriteBool(z.TurnPaused)
+	if err != nil {
+		err = msgp.WrapError(err, "TurnPaused")
+		return
+	}
 	return
 }
 
 // MarshalMsg implements msgp.Marshaler
 func (z *nsScannerOptions) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 3
+	// map header, size 5
 	// string "id"
-	o = append(o, 0x83, 0xa2, 0x69, 0x64)
+	o = append(o, 0x85, 0xa2, 0x69, 0x64)
 	o = msgp.AppendString(o, z.DiskID)
 	// string "m"
 	o = append(o, 0xa1, 0x6d)
@@ -129,6 +161,12 @@ func (z *nsScannerOptions) MarshalMsg(b []byte) (o []byte, err error) {
 			return
 		}
 	}
+	// string "tb"
+	o = append(o, 0xa2, 0x74, 0x62)
+	o = msgp.AppendInt64(o, z.TurnBudgetNs)
+	// string "tp"
+	o = append(o, 0xa2, 0x74, 0x70)
+	o = msgp.AppendBool(o, z.TurnPaused)
 	return
 }
 
@@ -179,6 +217,18 @@ func (z *nsScannerOptions) UnmarshalMsg(bts []byte) (o []byte, err error) {
 					return
 				}
 			}
+		case "tb":
+			z.TurnBudgetNs, bts, err = msgp.ReadInt64Bytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "TurnBudgetNs")
+				return
+			}
+		case "tp":
+			z.TurnPaused, bts, err = msgp.ReadBoolBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "TurnPaused")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -199,6 +249,7 @@ func (z *nsScannerOptions) Msgsize() (s int) {
 	} else {
 		s += z.Cache.Msgsize()
 	}
+	s += 3 + msgp.Int64Size + 3 + msgp.BoolSize
 	return
 }
 
@@ -256,6 +307,12 @@ func (z *nsScannerResp) DecodeMsg(dc *msgp.Reader) (err error) {
 					return
 				}
 			}
+		case "y":
+			z.Yielded, err = dc.ReadBool()
+			if err != nil {
+				err = msgp.WrapError(err, "Yielded")
+				return
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -269,9 +326,9 @@ func (z *nsScannerResp) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *nsScannerResp) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 2
+	// map header, size 3
 	// write "u"
-	err = en.Append(0x82, 0xa1, 0x75)
+	err = en.Append(0x83, 0xa1, 0x75)
 	if err != nil {
 		return
 	}
@@ -304,15 +361,25 @@ func (z *nsScannerResp) EncodeMsg(en *msgp.Writer) (err error) {
 			return
 		}
 	}
+	// write "y"
+	err = en.Append(0xa1, 0x79)
+	if err != nil {
+		return
+	}
+	err = en.WriteBool(z.Yielded)
+	if err != nil {
+		err = msgp.WrapError(err, "Yielded")
+		return
+	}
 	return
 }
 
 // MarshalMsg implements msgp.Marshaler
 func (z *nsScannerResp) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 2
+	// map header, size 3
 	// string "u"
-	o = append(o, 0x82, 0xa1, 0x75)
+	o = append(o, 0x83, 0xa1, 0x75)
 	if z.Update == nil {
 		o = msgp.AppendNil(o)
 	} else {
@@ -333,6 +400,9 @@ func (z *nsScannerResp) MarshalMsg(b []byte) (o []byte, err error) {
 			return
 		}
 	}
+	// string "y"
+	o = append(o, 0xa1, 0x79)
+	o = msgp.AppendBool(o, z.Yielded)
 	return
 }
 
@@ -388,6 +458,12 @@ func (z *nsScannerResp) UnmarshalMsg(bts []byte) (o []byte, err error) {
 					return
 				}
 			}
+		case "y":
+			z.Yielded, bts, err = msgp.ReadBoolBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "Yielded")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -414,5 +490,6 @@ func (z *nsScannerResp) Msgsize() (s int) {
 	} else {
 		s += z.Final.Msgsize()
 	}
+	s += 2 + msgp.BoolSize
 	return
 }

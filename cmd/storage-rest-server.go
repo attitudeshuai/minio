@@ -264,14 +264,32 @@ func (s *storageRESTServer) NSScannerHandler(ctx context.Context, params *nsScan
 			out <- resp
 		}
 	}()
+	// Reconstruct the scheduler turn for remote drives. Remote drives
+	// use a point-in-time pause snapshot since they cannot observe live
+	// scheduler state.
+	if params.TurnBudgetNs > 0 || params.TurnPaused {
+		turn := &bucketScanTurn{
+			Bucket: params.Cache.Info.Name,
+			Cycle:  params.Cache.Info.NextCycle,
+			budget: time.Duration(params.TurnBudgetNs),
+		}
+		if params.TurnBudgetNs > 0 {
+			turn.deadline = time.Now().Add(time.Duration(params.TurnBudgetNs))
+		}
+		paused := params.TurnPaused
+		turn.paused = func() bool { return paused }
+		ctx = contextWithBucketScanTurn(ctx, turn)
+	}
+
 	ui, err := s.getStorage().NSScanner(ctx, *params.Cache, updates, madmin.HealScanMode(params.ScanMode), nil)
 	wg.Wait()
-	if err != nil {
+	if err != nil && !errors.Is(err, errBucketScanTurnYielded) {
 		return grid.NewRemoteErr(err)
 	}
 	// Send final response.
 	resp := storageNSScannerRPC.NewResponse()
 	resp.Final = &ui
+	resp.Yielded = errors.Is(err, errBucketScanTurnYielded)
 	out <- resp
 	return nil
 }

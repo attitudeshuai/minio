@@ -199,10 +199,20 @@ func runDataScanner(ctx context.Context, objAPI ObjectLayer) {
 				saveBackgroundHealInfo(ctx, objAPI, newHealInfo)
 			}
 
+			// Per-bucket scheduling state lives on the leader; when the
+			// leader changes a fresh scheduler loads the persisted state
+			// and continues the same cycle.
+			sched := newBucketScanScheduler(objAPI)
+			sched.load(ctx)
+			globalBucketScanScheduler = sched
+
 			// Wait before starting next cycle and wait on startup.
 			results := make(chan DataUsageInfo, 1)
 			go storeDataUsageInBackend(ctx, objAPI, results)
-			err := objAPI.NSScanner(ctx, results, uint32(cycleInfo.current), scanMode)
+			err := objAPI.NSScanner(ctx, results, uint32(cycleInfo.current), scanMode, sched)
+			if sched.enabled() {
+				sched.endCycle(ctx)
+			}
 			scannerLogIf(ctx, err)
 			res := map[string]string{"cycle": strconv.FormatUint(cycleInfo.current, 10)}
 			if err != nil {
@@ -250,6 +260,12 @@ type folderScanner struct {
 
 	weSleep    func() bool
 	shouldHeal func() bool
+
+	// turn, when set, bounds this scan to a single scheduler turn and
+	// records progress (paths visited, objects processed, yield state).
+	turn *bucketScanTurn
+	// objectTicks counts object callbacks between yield checks.
+	objectTicks int
 
 	disks       []StorageAPI
 	disksQuorum int
@@ -313,6 +329,15 @@ func scanDataFolder(ctx context.Context, disks []StorageAPI, drive *xlStorage, c
 	updatePath, closeDisk := globalScannerMetrics.currentPathUpdater(basePath, cache.Info.Name)
 	defer closeDisk()
 
+	turn := bucketScanTurnFromContext(ctx)
+	if turn != nil {
+		rawUpdate := updatePath
+		updatePath = func(p string) {
+			rawUpdate(p)
+			turn.setPath(p)
+		}
+	}
+
 	s := folderScanner{
 		root:                  basePath,
 		getSize:               getSize,
@@ -323,6 +348,7 @@ func scanDataFolder(ctx context.Context, disks []StorageAPI, drive *xlStorage, c
 		healObjectSelect:      0,
 		scanMode:              scanMode,
 		weSleep:               weSleep,
+		turn:                  turn,
 		updates:               cache.Info.updates,
 		updateCurrentPath:     updatePath,
 		disks:                 disks,
@@ -367,6 +393,14 @@ func scanDataFolder(ctx context.Context, disks []StorageAPI, drive *xlStorage, c
 	folder := cachedFolder{name: cache.Info.Name, objectHealProbDiv: 1}
 	err := s.scanFolder(ctx, folder, &root)
 	if err != nil {
+		if errors.Is(err, errBucketScanTurnYielded) {
+			// The turn ended (budget exhausted or bucket paused); return
+			// whatever was fully scanned so the caller can merge it with
+			// the previous cache and resume later.
+			s.newCache.Info.LastUpdate = UTCNow()
+			s.newCache.Info.NextCycle = cache.Info.NextCycle
+			return s.newCache, err
+		}
 		// No useful information...
 		return cache, err
 	}
@@ -412,6 +446,9 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 			return ctx.Err()
 		default:
 		}
+		if f.turn != nil && f.turn.shouldYield(ctx) {
+			return errBucketScanTurnYielded
+		}
 		var abandonedChildren dataUsageHashMap
 		if !into.Compacted {
 			abandonedChildren = f.oldCache.findChildrenCopy(thisHash)
@@ -432,7 +469,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 			replicationCfg = f.oldCache.Info.replication
 		}
 
-		if f.weSleep() {
+		if f.weSleep != nil && f.weSleep() {
 			scannerSleeper.Sleep(ctx, dataScannerSleepPerFolder)
 		}
 
@@ -486,7 +523,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 			}
 
 			wait := noWait
-			if f.weSleep() {
+			if f.weSleep != nil && f.weSleep() {
 				// Dynamic time delay.
 				wait = scannerSleeper.Timer(ctx)
 			}
@@ -528,6 +565,18 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 			if err != errIgnoreFileContrib {
 				into.addSizes(sz)
 				into.Objects++
+				if f.turn != nil {
+					f.turn.addObjects(1)
+					// Checking time on every object is too costly.
+					f.objectTicks++
+					if f.objectTicks >= 128 {
+						f.objectTicks = 0
+						if f.turn.shouldYield(ctx) {
+							wait()
+							return errDoneForNow
+						}
+					}
+				}
 			}
 
 			wait() // wait to proceed to next entry.
@@ -536,6 +585,10 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 		})
 		if err != nil {
 			return err
+		}
+
+		if f.turn != nil && f.turn.isYielded() {
+			return errBucketScanTurnYielded
 		}
 
 		if foundObjects && globalIsErasure {
@@ -636,6 +689,9 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 			stopFn := globalScannerMetrics.log(scannerMetricScanFolder, f.root, folder.name)
 			scanFolder(folder)
 			stopFn(map[string]string{"type": "new"})
+			if f.turn != nil && f.turn.isYielded() {
+				return errBucketScanTurnYielded
+			}
 
 			// Add new folders if this is new and we don't have existing.
 			if !into.Compacted {
@@ -650,6 +706,16 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 		// Scan existing...
 		for _, folder := range existingFolders {
 			h := hashPath(folder.name)
+			// If this folder was fully scanned earlier in the current
+			// cycle (a resumed/yielded bucket scan), transfer it without
+			// walking the subtree again.
+			if !into.Compacted && f.oldCache.Info.NextCycle != 0 {
+				if prev := f.oldCache.find(folder.name); prev != nil && prev.ScannedCycle == f.oldCache.Info.NextCycle {
+					f.newCache.copyWithChildren(&f.oldCache, h, folder.parent)
+					into.addChild(h)
+					continue
+				}
+			}
 			// Check if we should skip scanning folder...
 			// We can only skip if we are not indexing into a compacted destination
 			// and the entry itself is compacted.
@@ -671,6 +737,9 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 			stopFn := globalScannerMetrics.log(scannerMetricScanFolder, f.root, folder.name)
 			scanFolder(folder)
 			stopFn(map[string]string{"type": "existing"})
+			if f.turn != nil && f.turn.isYielded() {
+				return errBucketScanTurnYielded
+			}
 		}
 
 		// Scan for healing
@@ -711,6 +780,9 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 		for k := range abandonedChildren {
 			if !f.shouldHeal() {
 				break
+			}
+			if f.turn != nil && f.turn.shouldYield(ctx) {
+				return errBucketScanTurnYielded
 			}
 			bucket, prefix := path2BucketObject(k)
 			stopFn := globalScannerMetrics.time(scannerMetricCheckMissing)
@@ -757,7 +829,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 						entry, _ = entries.firstFound()
 					}
 					wait := noWait
-					if f.weSleep() {
+					if f.weSleep != nil && f.weSleep() {
 						// wait timer per object.
 						wait = scannerSleeper.Timer(ctx)
 					}
@@ -840,12 +912,21 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 		break
 	}
 	if !wasCompacted {
+		// Mark the subtree as fully scanned in the current cycle so a
+		// resumed (yielded) scan does not walk it again. Interrupted
+		// folders return early and never reach this point.
+		if f.turn == nil || !f.turn.isYielded() {
+			into.ScannedCycle = f.newCache.Info.NextCycle
+		}
 		f.newCache.replaceHashed(thisHash, folder.parent, *into)
 	}
 
 	if !into.Compacted && f.newCache.Info.Name != folder.name {
 		flat := f.newCache.sizeRecursive(thisHash.Key())
 		flat.Compacted = true
+		if f.turn == nil || !f.turn.isYielded() {
+			flat.ScannedCycle = f.newCache.Info.NextCycle
+		}
 		var compact bool
 		if flat.Objects < dataScannerCompactLeastObject {
 			compact = true

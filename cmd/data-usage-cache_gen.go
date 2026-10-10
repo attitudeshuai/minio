@@ -1782,6 +1782,12 @@ func (z *dataUsageEntry) DecodeMsg(dc *msgp.Reader) (err error) {
 				err = msgp.WrapError(err, "Compacted")
 				return
 			}
+		case "scc":
+			z.ScannedCycle, err = dc.ReadUint32()
+			if err != nil {
+				err = msgp.WrapError(err, "ScannedCycle")
+				return
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -1801,12 +1807,16 @@ func (z *dataUsageEntry) DecodeMsg(dc *msgp.Reader) (err error) {
 // EncodeMsg implements msgp.Encodable
 func (z *dataUsageEntry) EncodeMsg(en *msgp.Writer) (err error) {
 	// check for omitted fields
-	zb0001Len := uint32(9)
-	var zb0001Mask uint16 /* 9 bits */
+	zb0001Len := uint32(10)
+	var zb0001Mask uint16 /* 10 bits */
 	_ = zb0001Mask
 	if z.AllTierStats == nil {
 		zb0001Len--
 		zb0001Mask |= 0x80
+	}
+	if z.ScannedCycle == 0 {
+		zb0001Len--
+		zb0001Mask |= 0x40
 	}
 	// variable map header, size zb0001Len
 	err = en.Append(0x80 | uint8(zb0001Len))
@@ -1964,7 +1974,7 @@ func (z *dataUsageEntry) EncodeMsg(en *msgp.Writer) (err error) {
 			}
 		}
 		// write "c"
-		err = en.Append(0xa1, 0x63)
+		err = en.Append(0xA1, 0x63)
 		if err != nil {
 			return
 		}
@@ -1972,6 +1982,18 @@ func (z *dataUsageEntry) EncodeMsg(en *msgp.Writer) (err error) {
 		if err != nil {
 			err = msgp.WrapError(err, "Compacted")
 			return
+		}
+		if (zb0001Mask & 0x40) == 0 { // if not omitted
+			// write "scc"
+			err = en.Append(0xa3, 0x73, 0x63, 0x63)
+			if err != nil {
+				return
+			}
+			err = en.WriteUint32(z.ScannedCycle)
+			if err != nil {
+				err = msgp.WrapError(err, "ScannedCycle")
+				return
+			}
 		}
 	}
 	return
@@ -1981,12 +2003,16 @@ func (z *dataUsageEntry) EncodeMsg(en *msgp.Writer) (err error) {
 func (z *dataUsageEntry) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
 	// check for omitted fields
-	zb0001Len := uint32(9)
-	var zb0001Mask uint16 /* 9 bits */
+	zb0001Len := uint32(10)
+	var zb0001Mask uint16 /* 10 bits */
 	_ = zb0001Mask
 	if z.AllTierStats == nil {
 		zb0001Len--
 		zb0001Mask |= 0x80
+	}
+	if z.ScannedCycle == 0 {
+		zb0001Len--
+		zb0001Mask |= 0x40
 	}
 	// variable map header, size zb0001Len
 	o = append(o, 0x80|uint8(zb0001Len))
@@ -2052,6 +2078,11 @@ func (z *dataUsageEntry) MarshalMsg(b []byte) (o []byte, err error) {
 		// string "c"
 		o = append(o, 0xa1, 0x63)
 		o = msgp.AppendBool(o, z.Compacted)
+		if (zb0001Mask & 0x40) == 0 { // if not omitted
+			// string "scc"
+			o = append(o, 0xa3, 0x73, 0x63, 0x63)
+			o = msgp.AppendUint32(o, z.ScannedCycle)
+		}
 	}
 	return
 }
@@ -2246,6 +2277,12 @@ func (z *dataUsageEntry) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err, "Compacted")
 				return
 			}
+		case "scc":
+			z.ScannedCycle, bts, err = msgp.ReadUint32Bytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "ScannedCycle")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -2278,6 +2315,9 @@ func (z *dataUsageEntry) Msgsize() (s int) {
 		}
 	}
 	s += 2 + msgp.BoolSize
+	if z.ScannedCycle != 0 {
+		s += 4 + msgp.Uint32Size
+	}
 	return
 }
 

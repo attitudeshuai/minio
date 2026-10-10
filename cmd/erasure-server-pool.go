@@ -732,7 +732,7 @@ func (z *erasureServerPools) StorageInfo(ctx context.Context, metrics bool) Stor
 	return globalNotificationSys.StorageInfo(ctx, z, metrics)
 }
 
-func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataUsageInfo, wantCycle uint32, healScanMode madmin.HealScanMode) error {
+func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataUsageInfo, wantCycle uint32, healScanMode madmin.HealScanMode, sched *bucketScanScheduler) error {
 	// Updates must be closed before we return.
 	defer xioutil.SafeClose(updates)
 
@@ -759,6 +759,13 @@ func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataU
 		totalResults += len(z.sets)
 	}
 	results = make([]dataUsageCache, totalResults)
+
+	// Initialize per-bucket scheduling, if configured. The barrier uses
+	// the number of sets so workers only start once every set registered.
+	if sched != nil && sched.enabled() {
+		sched.beginCycle(ctx, wantCycle, allBuckets, totalResults)
+		defer sched.endCycle(ctx)
+	}
 	// Collect for each set in serverPools.
 	for _, z := range z.serverPools {
 		for _, erObj := range z.sets {
@@ -777,7 +784,7 @@ func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataU
 					}
 				}()
 				// Start scanner. Blocks until done.
-				err := erObj.nsScanner(ctx, allBuckets, wantCycle, updates, healScanMode)
+				err := erObj.nsScanner(ctx, allBuckets, wantCycle, updates, healScanMode, sched)
 				if err != nil {
 					scannerLogIf(ctx, err)
 					mu.Lock()
