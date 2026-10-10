@@ -409,6 +409,9 @@ type transitionTask struct {
 	objInfo ObjectInfo
 	src     lcEventSrc
 	event   lifecycle.Event
+	// attempts is the number of attempts already made for this task when it
+	// was re-enqueued from the failure journal; zero means a fresh task.
+	attempts int
 }
 
 type transitionState struct {
@@ -423,34 +426,164 @@ type transitionState struct {
 	activeTasks          atomic.Int64
 	missedImmediateTasks atomic.Int64
 
+	// Transition failure handling counters.
+	failedTasks         atomic.Int64
+	retriedTasks        atomic.Int64
+	retrySucceededTasks atomic.Int64
+	skippedPausedTasks  atomic.Int64
+
+	// execTransitionObject performs the actual transition. It is a field so
+	// tests can inject a counting/failing executor.
+	execTransitionObject func(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo, lae lcAuditEvent) error
+
+	// failureCfg is read via getFailureConfig(); the zero value keeps the
+	// feature disabled, in which case behavior is identical to before.
+	failureCfgMu sync.RWMutex
+	failureCfg   transitionFailureConfig
+
+	// pendingTasks tracks queued and in-flight tasks for the restart
+	// snapshot; populated only when failure handling is enabled.
+	pendingMu    sync.Mutex
+	pendingTasks map[uint64]transitionTask
+	pendingDirty atomic.Bool
+
 	lastDayMu    sync.RWMutex
 	lastDayStats map[string]*lastDayTierStats
 }
 
-func (t *transitionState) queueTransitionTask(oi ObjectInfo, event lifecycle.Event, src lcEventSrc) {
-	task := transitionTask{objInfo: oi, event: event, src: src}
+// getFailureConfig returns the current transition failure configuration.
+func (t *transitionState) getFailureCfg() transitionFailureConfig {
+	t.failureCfgMu.RLock()
+	defer t.failureCfgMu.RUnlock()
+	return t.failureCfg
+}
+
+// UpdateFailureConfig applies new failure handling settings dynamically.
+func (t *transitionState) UpdateFailureConfig(cfg transitionFailureConfig) {
+	t.failureCfgMu.Lock()
+	t.failureCfg = cfg
+	t.failureCfgMu.Unlock()
+}
+
+func (t *transitionState) FailedTasks() int64         { return t.failedTasks.Load() }
+func (t *transitionState) RetriedTasks() int64        { return t.retriedTasks.Load() }
+func (t *transitionState) RetrySucceededTasks() int64 { return t.retrySucceededTasks.Load() }
+func (t *transitionState) SkippedPausedTasks() int64  { return t.skippedPausedTasks.Load() }
+
+// isTierPaused reports whether dispatching to the tier is currently paused.
+// It is a pure in-memory read and never fails open-loop callers.
+func (t *transitionState) isTierPaused(tier string) bool {
+	if !t.getFailureCfg().Enabled {
+		return false
+	}
+	return globalTransitionTierHealth != nil && globalTransitionTierHealth.IsPaused(tier)
+}
+
+// pendingTaskKey is the dedup key used for the restart snapshot.
+func pendingTaskKey(oi ObjectInfo, tier string) uint64 {
+	return xxh3.HashString(strings.Join([]string{tier, oi.Bucket, oi.Name, oi.VersionID}, "|"))
+}
+
+func (t *transitionState) trackEnqueued(task transitionTask) {
+	if !t.getFailureCfg().Enabled {
+		return
+	}
+	key := pendingTaskKey(task.objInfo, task.event.StorageClass)
+	t.pendingMu.Lock()
+	if _, ok := t.pendingTasks[key]; !ok {
+		t.pendingTasks[key] = task
+		t.pendingDirty.Store(true)
+	}
+	t.pendingMu.Unlock()
+}
+
+func (t *transitionState) trackDone(task transitionTask) {
+	if !t.getFailureCfg().Enabled {
+		return
+	}
+	key := pendingTaskKey(task.objInfo, task.event.StorageClass)
+	t.pendingMu.Lock()
+	if _, ok := t.pendingTasks[key]; ok {
+		delete(t.pendingTasks, key)
+		t.pendingDirty.Store(true)
+	}
+	t.pendingMu.Unlock()
+}
+
+func (t *transitionState) enqueue(task transitionTask, countMissed bool) {
 	select {
 	case <-t.ctx.Done():
 	case t.transitionCh <- task:
+		t.trackEnqueued(task)
 	default:
-		switch src {
-		case lcEventSrc_s3PutObject, lcEventSrc_s3CopyObject, lcEventSrc_s3CompleteMultipartUpload:
-			// Update missed immediate tasks only for incoming requests.
-			t.missedImmediateTasks.Add(1)
+		if countMissed {
+			switch task.src {
+			case lcEventSrc_s3PutObject, lcEventSrc_s3CopyObject, lcEventSrc_s3CompleteMultipartUpload:
+				// Update missed immediate tasks only for incoming requests.
+				t.missedImmediateTasks.Add(1)
+			}
 		}
 	}
 }
 
+func (t *transitionState) queueTransitionTask(oi ObjectInfo, event lifecycle.Event, src lcEventSrc) {
+	if t.isTierPaused(event.StorageClass) {
+		// Do not dispatch new transitions to paused tiers; the object stays
+		// local and untouched and will be picked up from the failure list
+		// (or a later scan) once the tier resumes.
+		t.skippedPausedTasks.Add(1)
+		return
+	}
+	t.enqueue(transitionTask{objInfo: oi, event: event, src: src}, true)
+}
+
+// queueTransitionRetry enqueues a task re-scheduled from the failure journal.
+func (t *transitionState) queueTransitionRetry(rec transitionFailureRecord) {
+	if t.isTierPaused(rec.Tier) {
+		t.skippedPausedTasks.Add(1)
+		return
+	}
+	action := lifecycle.TransitionAction
+	if rec.Noncurrent {
+		action = lifecycle.TransitionVersionAction
+	}
+	oi := ObjectInfo{
+		Bucket:    rec.Bucket,
+		Name:      rec.Object,
+		VersionID: rec.VersionID,
+		Size:      rec.Size,
+		ETag:      rec.ETag,
+		ModTime:   rec.ModTime,
+	}
+	t.enqueue(transitionTask{
+		objInfo:  oi,
+		src:      lcEventSrc_Scanner,
+		event:    lifecycle.Event{Action: action, StorageClass: rec.Tier},
+		attempts: rec.Attempts,
+	}, false)
+}
+
 var globalTransitionState *transitionState
+
+// Cluster-wide transition failure handling components. Both are populated
+// when the failure handling feature is enabled and remain nil otherwise, so
+// all failure-handling paths degrade to the legacy behavior.
+var (
+	globalTransitionFailureJournal *transitionFailureJournal
+	globalTransitionTierHealth     *transitionTierHealthMgr
+)
 
 // newTransitionState returns a transitionState object ready to be initialized
 // via its Init method.
 func newTransitionState(ctx context.Context) *transitionState {
 	return &transitionState{
-		transitionCh: make(chan transitionTask, 100000),
-		ctx:          ctx,
-		killCh:       make(chan struct{}),
-		lastDayStats: make(map[string]*lastDayTierStats),
+		transitionCh:         make(chan transitionTask, 100000),
+		ctx:                  ctx,
+		killCh:               make(chan struct{}),
+		lastDayStats:         make(map[string]*lastDayTierStats),
+		pendingTasks:         make(map[uint64]transitionTask),
+		execTransitionObject: transitionObject,
+		failureCfg:           globalILMConfig.getTransitionFailureConfig(),
 	}
 }
 
@@ -466,6 +599,7 @@ func (t *transitionState) Init(objAPI ObjectLayer) {
 	defer t.mu.Unlock()
 
 	t.objAPI = objAPI
+	t.failureCfg = globalILMConfig.getTransitionFailureConfig()
 	t.updateWorkers(n)
 }
 
@@ -486,6 +620,37 @@ func (t *transitionState) MissedImmediateTasks() int64 {
 	return t.missedImmediateTasks.Load()
 }
 
+// handleTransitionFailure archives a failed attempt into the transition
+// failure journal according to the error classification.
+func (t *transitionState) handleTransitionFailure(task transitionTask, cfg transitionFailureConfig, err error) {
+	cat, recordable, retryable := classifyTransitionError(err)
+	if !recordable || globalTransitionFailureJournal == nil {
+		return
+	}
+	t.failedTasks.Add(1)
+	if task.attempts > 0 {
+		t.retriedTasks.Add(1)
+	}
+	oi := task.objInfo
+	tier := task.event.StorageClass
+	// Always build the candidate from attempt zero; the journal reconciles
+	// it with the persisted record (monotonic attempts, preserved first
+	// failure time) under a per-record distributed lock.
+	rec := recordTransitionFailure(nil, oi, tier, isNoncurrentTransitionTask(task.event),
+		cat, err.Error(), cfg, UTCNow())
+	if !retryable {
+		// Configuration problems are archived once as exhausted and are not
+		// retried.
+		rec.Status = transitionFailureExhausted
+		rec.NextRetryAt = time.Time{}
+	}
+	// Seed the candidate's attempt count when this was a journal-driven retry.
+	if task.attempts > 0 {
+		rec.Attempts = task.attempts
+	}
+	globalTransitionFailureJournal.upsert(t.ctx, rec)
+}
+
 // worker waits for transition tasks
 func (t *transitionState) worker(objectAPI ObjectLayer) {
 	for {
@@ -498,15 +663,40 @@ func (t *transitionState) worker(objectAPI ObjectLayer) {
 			if !ok {
 				return
 			}
+			cfg := t.getFailureCfg()
+
+			// Re-check tier pause right before execution: tasks queued
+			// before the tier paused must not touch the remote tier.
+			if cfg.Enabled && globalTransitionTierHealth != nil &&
+				globalTransitionTierHealth.IsPaused(task.event.StorageClass) {
+				t.skippedPausedTasks.Add(1)
+				t.trackDone(task)
+				continue
+			}
+
 			t.activeTasks.Add(1)
-			if err := transitionObject(t.ctx, objectAPI, task.objInfo, newLifecycleAuditEvent(task.src, task.event)); err != nil {
+			exec := t.execTransitionObject
+			if exec == nil {
+				exec = transitionObject
+			}
+			err := exec(t.ctx, objectAPI, task.objInfo, newLifecycleAuditEvent(task.src, task.event))
+			if err != nil {
 				if !isErrVersionNotFound(err) && !isErrObjectNotFound(err) && !xnet.IsNetworkOrHostDown(err, false) {
 					if !strings.Contains(err.Error(), "use of closed network connection") {
 						transitionLogIf(t.ctx, fmt.Errorf("Transition to %s failed for %s/%s version:%s with %w",
 							task.event.StorageClass, task.objInfo.Bucket, task.objInfo.Name, task.objInfo.VersionID, err))
 					}
 				}
+				if cfg.Enabled {
+					t.handleTransitionFailure(task, cfg, err)
+				}
 			} else {
+				if cfg.Enabled && task.attempts > 0 && globalTransitionFailureJournal != nil {
+					t.retrySucceededTasks.Add(1)
+					id := transitionFailureRecordID(task.event.StorageClass,
+						task.objInfo.Bucket, task.objInfo.Name, task.objInfo.VersionID)
+					globalTransitionFailureJournal.succeed(t.ctx, id)
+				}
 				ts := tierStats{
 					TotalSize:   uint64(task.objInfo.Size),
 					NumVersions: 1,
@@ -517,6 +707,7 @@ func (t *transitionState) worker(objectAPI ObjectLayer) {
 				t.addLastDayStats(task.event.StorageClass, ts)
 			}
 			t.activeTasks.Add(-1)
+			t.trackDone(task)
 		}
 	}
 }

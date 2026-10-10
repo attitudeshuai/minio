@@ -703,13 +703,17 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 		if err != nil {
 			errs = append(errs, fmt.Errorf("Unable to apply ilm config: %w", err))
 		} else {
+			globalILMConfig.update(ilmCfg)
 			if globalTransitionState != nil {
 				globalTransitionState.UpdateWorkers(ilmCfg.TransitionWorkers)
+				globalTransitionState.UpdateFailureConfig(globalILMConfig.getTransitionFailureConfig())
 			}
 			if globalExpiryState != nil {
 				globalExpiryState.ResizeWorkers(ilmCfg.ExpirationWorkers)
 			}
-			globalILMConfig.update(ilmCfg)
+			// Lazily start the failure handler if the feature got enabled
+			// after startup.
+			initTransitionFailureHandlerOnce()
 		}
 	}
 	globalServerConfigMu.Lock()

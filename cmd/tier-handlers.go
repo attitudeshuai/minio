@@ -22,6 +22,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	jsoniter "github.com/json-iterator/go"
 	"github.com/minio/madmin-go/v3"
@@ -31,6 +32,19 @@ import (
 )
 
 var (
+	// error returned when transition failure handling is disabled.
+	errTierFailureHandlingDisabled = AdminError{
+		Code:       "XMinioAdminTierFailureHandlingDisabled",
+		Message:    "Transition failure handling is disabled; set ilm transition_failure_handling=on first",
+		StatusCode: http.StatusPreconditionFailed,
+	}
+	// error returned for invalid failure list filters.
+	errTierFailureInvalidFilter = AdminError{
+		Code:       "XMinioAdminTierFailureInvalidFilter",
+		Message:    "Invalid status filter; allowed values are 'pending' and 'exhausted'",
+		StatusCode: http.StatusBadRequest,
+	}
+
 	// error returned when remote tier already exists
 	errTierAlreadyExists = AdminError{
 		Code:       "XMinioAdminTierAlreadyExists",
@@ -261,4 +275,191 @@ func (api adminAPIHandlers) TierStatsHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeSuccessResponseJSON(w, data)
+}
+
+// tierFailureInfo is one entry in the per-tier failed transition list.
+type tierFailureInfo struct {
+	ID            string    `json:"id"`
+	Bucket        string    `json:"bucket"`
+	Object        string    `json:"object"`
+	VersionID     string    `json:"versionId"`
+	Tier          string    `json:"tier"`
+	Size          int64     `json:"size"`
+	ETag          string    `json:"etag"`
+	LastModified  time.Time `json:"lastModified"`
+	Noncurrent    bool      `json:"noncurrent"`
+	Category      string    `json:"errorCategory"`
+	LastErr       string    `json:"lastError"`
+	Attempts      int       `json:"attempts"`
+	FirstFailedAt time.Time `json:"firstFailedAt"`
+	LastFailedAt  time.Time `json:"lastFailedAt"`
+	NextRetryAt   time.Time `json:"nextRetryAt"`
+	Status        string    `json:"status"`
+}
+
+func newTierFailureInfo(rec transitionFailureRecord) tierFailureInfo {
+	return tierFailureInfo{
+		ID:            rec.ID,
+		Bucket:        rec.Bucket,
+		Object:        rec.Object,
+		VersionID:     rec.VersionID,
+		Tier:          rec.Tier,
+		Size:          rec.Size,
+		ETag:          rec.ETag,
+		LastModified:  rec.ModTime,
+		Noncurrent:    rec.Noncurrent,
+		Category:      string(rec.Category),
+		LastErr:       rec.LastErr,
+		Attempts:      rec.Attempts,
+		FirstFailedAt: rec.FirstFailedAt,
+		LastFailedAt:  rec.LastFailedAt,
+		NextRetryAt:   rec.NextRetryAt,
+		Status:        string(rec.Status),
+	}
+}
+
+// tierStatusInfo describes the pause/health state of one remote tier.
+type tierStatusInfo struct {
+	Tier                string    `json:"tier"`
+	Paused              bool      `json:"paused"`
+	Manual              bool      `json:"manual"`
+	ConsecutiveFailures int       `json:"consecutiveFailures"`
+	PausedAt            time.Time `json:"pausedAt,omitempty"`
+	LastFailureAt       time.Time `json:"lastFailureAt,omitempty"`
+	LastErr             string    `json:"lastError,omitempty"`
+	ResumedAt           time.Time `json:"resumedAt,omitempty"`
+	Version             uint64    `json:"version"`
+	PendingFailures     int       `json:"pendingFailures"`
+	ExhaustedFailures   int       `json:"exhaustedFailures"`
+}
+
+// ListTierFailuresHandler returns the archived failure list, optionally
+// filtered by tier, bucket and status.
+func (api adminAPIHandlers) ListTierFailuresHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	objAPI, _ := validateAdminReq(ctx, w, r, policy.ListTierAction)
+	if objAPI == nil {
+		return
+	}
+
+	tierName := r.Form.Get("tier")
+	bucket := r.Form.Get("bucket")
+	switch transitionFailureStatus(r.Form.Get("status")) {
+	case "", transitionFailurePending, transitionFailureExhausted:
+	default:
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errTierFailureInvalidFilter), r.URL)
+		return
+	}
+	status := transitionFailureStatus(r.Form.Get("status"))
+
+	if globalTransitionFailureJournal == nil {
+		writeSuccessResponseJSON(w, []byte("[]"))
+		return
+	}
+
+	infos, err := listTierFailures(ctx, globalTransitionFailureJournal, tierName, bucket, status)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	data, err := json.Marshal(infos)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	writeSuccessResponseJSON(w, data)
+}
+
+// ClearTierFailuresHandler removes failure records. By default only exhausted
+// records are removed; all=true is required to remove pending ones too.
+func (api adminAPIHandlers) ClearTierFailuresHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	objAPI, _ := validateAdminReq(ctx, w, r, policy.SetTierAction)
+	if objAPI == nil {
+		return
+	}
+
+	tierName := r.Form.Get("tier")
+	all := r.Form.Get("all") == "true"
+	if globalTransitionFailureJournal == nil {
+		writeSuccessResponseJSON(w, []byte(`{"cleared":0}`))
+		return
+	}
+	removed, err := clearTierFailures(ctx, globalTransitionFailureJournal, tierName, all)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	writeSuccessResponseJSON(w, []byte(`{"cleared":`+strconv.Itoa(removed)+`}`))
+}
+
+// TierStatusHandler returns the cluster-wide pause state of remote tiers.
+func (api adminAPIHandlers) TierStatusHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	objAPI, _ := validateAdminReq(ctx, w, r, policy.ListTierAction)
+	if objAPI == nil {
+		return
+	}
+
+	if globalTransitionTierHealth == nil {
+		writeSuccessResponseJSON(w, []byte("[]"))
+		return
+	}
+
+	infos, err := listTierStatus(ctx, globalTransitionTierHealth, globalTransitionFailureJournal, r.Form.Get("tier"))
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	data, err := json.Marshal(infos)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	writeSuccessResponseJSON(w, data)
+}
+
+// PauseTierHandler manually pauses transitions to a tier.
+func (api adminAPIHandlers) PauseTierHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	objAPI, _ := validateAdminReq(ctx, w, r, policy.SetTierAction)
+	if objAPI == nil {
+		return
+	}
+	tierName := mux.Vars(r)["tier"]
+
+	if globalTransitionTierHealth == nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errTierFailureHandlingDisabled), r.URL)
+		return
+	}
+	if err := pauseTransitionTier(ctx, objAPI, globalTransitionTierHealth, tierName, r.Form.Get("reason")); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	writeSuccessNoContent(w)
+}
+
+// ResumeTierHandler manually resumes transitions to a tier.
+func (api adminAPIHandlers) ResumeTierHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	objAPI, _ := validateAdminReq(ctx, w, r, policy.SetTierAction)
+	if objAPI == nil {
+		return
+	}
+	tierName := mux.Vars(r)["tier"]
+
+	if globalTransitionTierHealth == nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, errTierFailureHandlingDisabled), r.URL)
+		return
+	}
+	if err := resumeTransitionTier(ctx, objAPI, globalTransitionTierHealth, tierName); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	writeSuccessNoContent(w)
 }

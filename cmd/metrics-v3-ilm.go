@@ -26,6 +26,11 @@ const (
 	transitionActiveTasks          = "transition_active_tasks"
 	transitionPendingTasks         = "transition_pending_tasks"
 	transitionMissedImmediateTasks = "transition_missed_immediate_tasks"
+	transitionFailedTasks          = "transition_failed_tasks"
+	transitionRetriedTasks         = "transition_retried_tasks"
+	transitionRetrySucceededTasks  = "transition_retry_succeeded_tasks"
+	transitionSkippedPausedTasks   = "transition_skipped_paused_tasks"
+	transitionPausedTiers          = "transition_paused_tiers"
 	versionsScanned                = "versions_scanned"
 )
 
@@ -34,6 +39,11 @@ var (
 	ilmTransitionActiveTasksMD          = NewGaugeMD(transitionActiveTasks, "Number of active ILM transition tasks")
 	ilmTransitionPendingTasksMD         = NewGaugeMD(transitionPendingTasks, "Number of pending ILM transition tasks in the queue")
 	ilmTransitionMissedImmediateTasksMD = NewCounterMD(transitionMissedImmediateTasks, "Number of missed immediate ILM transition tasks")
+	ilmTransitionFailedTasksMD          = NewCounterMD(transitionFailedTasks, "Total number of failed ILM transition attempts archived since server start")
+	ilmTransitionRetriedTasksMD         = NewCounterMD(transitionRetriedTasks, "Total number of retried ILM transition attempts since server start")
+	ilmTransitionRetrySucceededTasksMD  = NewCounterMD(transitionRetrySucceededTasks, "Total number of failed ILM transitions that eventually succeeded on retry since server start")
+	ilmTransitionSkippedPausedTasksMD   = NewCounterMD(transitionSkippedPausedTasks, "Total number of ILM transition tasks skipped because their target tier was paused since server start")
+	ilmTransitionPausedTiersMD          = NewGaugeMD(transitionPausedTiers, "Number of remote tiers currently paused for ILM transitions")
 	ilmVersionsScannedMD                = NewCounterMD(versionsScanned, "Total number of object versions checked for ILM actions since server start")
 )
 
@@ -46,7 +56,20 @@ func loadILMMetrics(_ context.Context, m MetricValues, _ *metricsCache) error {
 		m.Set(transitionActiveTasks, float64(globalTransitionState.ActiveTasks()))
 		m.Set(transitionPendingTasks, float64(globalTransitionState.PendingTasks()))
 		m.Set(transitionMissedImmediateTasks, float64(globalTransitionState.MissedImmediateTasks()))
+		m.Set(transitionFailedTasks, float64(globalTransitionState.FailedTasks()))
+		m.Set(transitionRetriedTasks, float64(globalTransitionState.RetriedTasks()))
+		m.Set(transitionRetrySucceededTasks, float64(globalTransitionState.RetrySucceededTasks()))
+		m.Set(transitionSkippedPausedTasks, float64(globalTransitionState.SkippedPausedTasks()))
 	}
+	pausedTiers := 0
+	if globalTransitionTierHealth != nil {
+		for _, h := range globalTransitionTierHealth.All() {
+			if h.Paused {
+				pausedTiers++
+			}
+		}
+	}
+	m.Set(transitionPausedTiers, float64(pausedTiers))
 	m.Set(versionsScanned, float64(globalScannerMetrics.lifetime(scannerMetricILM)))
 
 	return nil

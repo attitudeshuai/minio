@@ -376,6 +376,13 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		// Tier stats
 		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier-stats").HandlerFunc(adminMiddleware(adminAPI.TierStatsHandler))
 
+		// Transition failure handling
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier-failures").HandlerFunc(adminMiddleware(adminAPI.ListTierFailuresHandler))
+		adminRouter.Methods(http.MethodDelete).Path(adminVersion + "/tier-failures").HandlerFunc(adminMiddleware(adminAPI.ClearTierFailuresHandler))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/tier-status").HandlerFunc(adminMiddleware(adminAPI.TierStatusHandler))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/tier-pause/{tier}").HandlerFunc(adminMiddleware(adminAPI.PauseTierHandler))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/tier-resume/{tier}").HandlerFunc(adminMiddleware(adminAPI.ResumeTierHandler))
+
 		// Cluster Replication APIs
 		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/add").HandlerFunc(adminMiddleware(adminAPI.SiteReplicationAdd))
 		adminRouter.Methods(http.MethodPut).Path(adminVersion + "/site-replication/remove").HandlerFunc(adminMiddleware(adminAPI.SiteReplicationRemove))

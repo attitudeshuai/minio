@@ -43,6 +43,22 @@ func shutdownHealMRFWithTimeout() {
 	}
 }
 
+// shutdownTransitionPendingWithTimeout flushes queued/in-flight transition
+// tasks to local drives so they can be replayed after restart.
+func shutdownTransitionPendingWithTimeout() {
+	const shutdownTimeout = time.Minute
+
+	finished := make(chan struct{})
+	go func() {
+		shutdownTransitionPending(context.Background())
+		close(finished)
+	}()
+	select {
+	case <-time.After(shutdownTimeout):
+	case <-finished:
+	}
+}
+
 func handleSignals() {
 	// Custom exit function
 	exit := func(success bool) {
@@ -66,6 +82,7 @@ func handleSignals() {
 
 	stopProcess := func() bool {
 		shutdownHealMRFWithTimeout() // this can take time sometimes, it needs to be executed
+		shutdownTransitionPendingWithTimeout()
 		// before stopping s3 operations
 
 		// send signal to various go-routines that they need to quit.

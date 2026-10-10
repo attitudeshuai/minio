@@ -1068,6 +1068,12 @@ func serverMain(ctx *cli.Context) {
 			globalTransitionState.Init(newObject)
 		})
 
+		// Start transition failure handling (no-op unless enabled via ilm
+		// configuration; safe to call again on later dynamic config updates).
+		bootstrapTrace("initTransitionFailureHandler", func() {
+			initTransitionFailureHandlerOnce()
+		})
+
 		go func() {
 			// Initialize transition tier configuration manager
 			bootstrapTrace("globalTierConfigMgr.Init", func() {
