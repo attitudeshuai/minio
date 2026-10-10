@@ -358,6 +358,12 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 			adminMiddleware(adminAPI.DescribeBatchJob))
 		adminRouter.Methods(http.MethodDelete).Path(adminVersion + "/cancel-job").HandlerFunc(
 			adminMiddleware(adminAPI.CancelBatchJob))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/pause-job").HandlerFunc(
+			adminMiddleware(adminAPI.PauseBatchJob))
+		adminRouter.Methods(http.MethodPost).Path(adminVersion + "/resume-job").HandlerFunc(
+			adminMiddleware(adminAPI.ResumeBatchJob))
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/queue-jobs").HandlerFunc(
+			adminMiddleware(adminAPI.ListBatchJobQueue))
 
 		// Bucket migration operations
 		// ExportBucketMetaHandler

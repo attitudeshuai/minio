@@ -587,6 +587,14 @@ func applyDynamicConfigForSubSys(ctx context.Context, objAPI ObjectLayer, s conf
 			errs = append(errs, fmt.Errorf("Unable to apply batch config: %w", err))
 		} else {
 			globalBatchConfig.Update(batchCfg)
+			// Apply admission limits and watermark thresholds live.
+			if globalBatchJobPool != nil {
+				globalBatchJobPool.updateLimits(batchCfg.Limits())
+				if globalBatchJobPool.monitor != nil {
+					wm := batchCfg.Watermarks()
+					globalBatchJobPool.monitor.updateThresholds(wm.CPU, wm.Mem, wm.Drive)
+				}
+			}
 		}
 	case config.ScannerSubSys:
 		scannerCfg, err := scanner.LookupConfig(s[config.ScannerSubSys][config.Default])

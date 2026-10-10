@@ -245,4 +245,29 @@ Examples:
 		"Please input a non-negative duration",
 		"expiration_workers_wait should be > 0ms",
 	)
+	ErrInvalidBatchMaxJobs = newErrFn(
+		"Invalid value for batch job concurrency limits",
+		"Please input positive integers for max_jobs/queue_capacity and non-negative integers for per-type limits",
+		"max_jobs and queue_capacity should be > 0, replication/keyrotation/expiration_max_jobs should be >= 0",
+	)
+	ErrInvalidBatchQueueCapacity = newErrFn(
+		"Invalid value for batch job queue capacity",
+		"Please input a positive integer",
+		"queue_capacity should be > 0",
+	)
+	ErrInvalidBatchWatermark = newErrFn(
+		"Invalid value for batch job resource watermark",
+		"Please input an integer between 0 (disabled) and 100",
+		"cpu_watermark, mem_watermark and drive_watermark should be in the range 0-100",
+	)
+	ErrInvalidBatchResourceThrottleWait = newErrFn(
+		"Invalid value for batch resource throttle wait",
+		"Please input a non-negative duration",
+		"resource_throttle_wait should be >= 0ms",
+	)
+	ErrInvalidBatchPriority = newErrFn(
+		"Invalid value for batch job default priority",
+		"Please input one of low, normal or high",
+		"replication_priority, keyrotation_priority and expiration_priority should be low, normal or high",
+	)
 )

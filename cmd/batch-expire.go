@@ -418,6 +418,9 @@ func batchObjsForDelete(ctx context.Context, r *BatchJobExpire, ri *batchJobInfo
 			if wait := globalBatchConfig.ExpirationWait(); wait > 0 {
 				time.Sleep(wait)
 			}
+			if wait := batchResourceThrottleWait(); wait > 0 {
+				time.Sleep(wait)
+			}
 		}
 		i++
 		wk.Take()
@@ -729,9 +732,12 @@ func (r *BatchJobExpire) Start(ctx context.Context, api ObjectLayer, job BatchJo
 		}
 	}
 
-	if context.Cause(ctx) != nil {
+	if cause := context.Cause(ctx); cause != nil {
+		// Job was paused/canceled during the walk: flush the marker so
+		// resume continues from where the scan stopped.
+		persistBatchJobOnInterruption(ctx, api, job, ri)
 		xioutil.SafeClose(expireCh)
-		return context.Cause(ctx)
+		return cause
 	}
 	pushToExpire()
 	// Send any remaining objects downstream

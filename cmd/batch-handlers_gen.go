@@ -179,6 +179,12 @@ func (z *BatchJobRequest) DecodeMsg(dc *msgp.Reader) (err error) {
 					return
 				}
 			}
+		case "pri":
+			z.Priority, err = dc.ReadString()
+			if err != nil {
+				err = msgp.WrapError(err, "Priority")
+				return
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -192,9 +198,9 @@ func (z *BatchJobRequest) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *BatchJobRequest) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 6
+	// map header, size 7
 	// write "ID"
-	err = en.Append(0x86, 0xa2, 0x49, 0x44)
+	err = en.Append(0x87, 0xa2, 0x49, 0x44)
 	if err != nil {
 		return
 	}
@@ -274,15 +280,25 @@ func (z *BatchJobRequest) EncodeMsg(en *msgp.Writer) (err error) {
 			return
 		}
 	}
+	// write "pri"
+	err = en.Append(0xa3, 0x70, 0x72, 0x69)
+	if err != nil {
+		return
+	}
+	err = en.WriteString(z.Priority)
+	if err != nil {
+		err = msgp.WrapError(err, "Priority")
+		return
+	}
 	return
 }
 
 // MarshalMsg implements msgp.Marshaler
 func (z *BatchJobRequest) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 6
+	// map header, size 7
 	// string "ID"
-	o = append(o, 0x86, 0xa2, 0x49, 0x44)
+	o = append(o, 0x87, 0xa2, 0x49, 0x44)
 	o = msgp.AppendString(o, z.ID)
 	// string "User"
 	o = append(o, 0xa4, 0x55, 0x73, 0x65, 0x72)
@@ -323,6 +339,9 @@ func (z *BatchJobRequest) MarshalMsg(b []byte) (o []byte, err error) {
 			return
 		}
 	}
+	// string "pri"
+	o = append(o, 0xa3, 0x70, 0x72, 0x69)
+	o = msgp.AppendString(o, z.Priority)
 	return
 }
 
@@ -413,6 +432,12 @@ func (z *BatchJobRequest) UnmarshalMsg(bts []byte) (o []byte, err error) {
 					return
 				}
 			}
+		case "pri":
+			z.Priority, bts, err = msgp.ReadStringBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "Priority")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -445,6 +470,7 @@ func (z *BatchJobRequest) Msgsize() (s int) {
 	} else {
 		s += z.Expire.Msgsize()
 	}
+	s += 4 + msgp.StringPrefixSize + len(z.Priority)
 	return
 }
 

@@ -288,3 +288,59 @@ func (s *BatchJobSize) UnmarshalYAML(unmarshal func(any) error) error {
 	*s = BatchJobSize(sz)
 	return nil
 }
+
+// batchPriority is the scheduling priority declared on a batch job. The
+// empty value means "not declared" and resolves to the per-type server
+// default at admission time.
+type batchPriority string
+
+const (
+	batchPriorityUnspecified batchPriority = ""
+	batchPriorityLow         batchPriority = "low"
+	batchPriorityNormal      batchPriority = "normal"
+	batchPriorityHigh        batchPriority = "high"
+)
+
+// scheduling weights: higher priority overtakes lower priority waiters;
+// unspecified behaves as normal. The aging boost is capped at +20 so an old
+// enough waiter (20 aging slices = 200s for a low priority job) ties a
+// freshly queued high priority job and wins on submit order, bounding the
+// wait any job class can suffer under a continuous high priority stream.
+const (
+	batchPriorityWeightLow    = 0
+	batchPriorityWeightNormal = 10
+	batchPriorityWeightHigh   = 20
+	batchPriorityAgingMax     = 20
+)
+
+func (p batchPriority) weight() int {
+	switch p {
+	case batchPriorityHigh:
+		return batchPriorityWeightHigh
+	case batchPriorityLow:
+		return batchPriorityWeightLow
+	default:
+		return batchPriorityWeightNormal
+	}
+}
+
+// valid reports whether p is an accepted on-the-wire value.
+func (p batchPriority) valid() bool {
+	switch p {
+	case batchPriorityUnspecified, batchPriorityLow, batchPriorityNormal, batchPriorityHigh:
+		return true
+	}
+	return false
+}
+
+// normalizeBatchPriority lower-cases the input, validates the enumeration
+// and returns the declared priority (batchPriorityUnspecified when empty).
+func normalizeBatchPriority(s string) (batchPriority, error) {
+	p := batchPriority(strings.ToLower(strings.TrimSpace(s)))
+	if !p.valid() {
+		return batchPriorityUnspecified, BatchJobYamlErr{
+			msg: fmt.Sprintf("priority must be one of low, normal or high; got %q", s),
+		}
+	}
+	return p, nil
+}

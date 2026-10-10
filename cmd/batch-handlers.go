@@ -72,7 +72,11 @@ type BatchJobRequest struct {
 	Replicate *BatchJobReplicateV1 `yaml:"replicate" json:"replicate"`
 	KeyRotate *BatchJobKeyRotateV1 `yaml:"keyrotate" json:"keyrotate"`
 	Expire    *BatchJobExpire      `yaml:"expire" json:"expire"`
-	ctx       context.Context      `msg:"-"`
+	// Priority is the optional scheduling priority declared in the job
+	// YAML (low|normal|high). Empty means the per-type server default
+	// applies at admission time.
+	Priority string          `yaml:"priority,omitempty" json:"priority,omitempty" msg:"pri"`
+	ctx      context.Context `msg:"-"`
 }
 
 // RedactSensitive will redact any sensitive information in b.
@@ -503,9 +507,20 @@ func (r *BatchJobReplicateV1) StartFromSource(ctx context.Context, api ObjectLay
 				if wait := globalBatchConfig.ReplicationWait(); wait > 0 {
 					time.Sleep(wait)
 				}
+				if wait := batchResourceThrottleWait(); wait > 0 {
+					time.Sleep(wait)
+				}
 			}()
 		}
 		wk.Wait()
+
+		if cause := context.Cause(ctx); cause != nil {
+			// Remote-source job paused/canceled: persist progress and unwind
+			// without marking the job complete (the walk may be partial).
+			persistBatchJobOnInterruption(ctx, api, job, ri)
+			cancel()
+			return cause
+		}
 
 		ri.RetryAttempts = attempts
 		ri.Complete = ri.ObjectsFailed == 0
@@ -992,6 +1007,21 @@ func (ri *batchJobInfo) updateAfter(ctx context.Context, api ObjectLayer, durati
 	return nil
 }
 
+// persistBatchJobOnInterruption force-persists the job progress marker
+// when a Start loop is unwinding due to a canceled job context (operator
+// pause/cancel). The persistence itself runs on an independent context
+// because the job context is already canceled. It is a no-op when the job
+// ended naturally (no context cause), in which case the Start loop performs
+// its own regular completion persistence.
+func persistBatchJobOnInterruption(jobCtx context.Context, api ObjectLayer, job BatchJobRequest, ri *batchJobInfo) {
+	if context.Cause(jobCtx) == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(GlobalContext, 30*time.Second)
+	defer cancel()
+	batchLogIf(ctx, ri.updateAfter(ctx, api, 0, job))
+}
+
 // Note: to be used only with batch jobs that affect multiple versions through
 // a single action. e.g batch-expire has an option to expire all versions of an
 // object which matches the given filters.
@@ -1307,12 +1337,19 @@ func (r *BatchJobReplicateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 				if wait := globalBatchConfig.ReplicationWait(); wait > 0 {
 					time.Sleep(wait)
 				}
+				if wait := batchResourceThrottleWait(); wait > 0 {
+					time.Sleep(wait)
+				}
 			}()
 		}
 		wk.Wait()
 		// Do not need to retry if we can't list objects on source.
-		if context.Cause(ctx) != nil {
-			return context.Cause(ctx)
+		if cause := context.Cause(ctx); cause != nil {
+			// Job was paused/canceled: persist the progress marker without
+			// marking the job complete and unwind without retrying.
+			persistBatchJobOnInterruption(ctx, api, job, ri)
+			cancelCause(nil)
+			return cause
 		}
 		ri.RetryAttempts = attempts
 		ri.Complete = ri.ObjectsFailed == 0
@@ -1522,6 +1559,9 @@ func (j BatchJobRequest) Type() madmin.BatchJobType {
 // Validate validates the current job, used by 'save()' before
 // persisting the job request
 func (j BatchJobRequest) Validate(ctx context.Context, o ObjectLayer) error {
+	if _, err := normalizeBatchPriority(j.Priority); err != nil {
+		return err
+	}
 	switch {
 	case j.Replicate != nil:
 		return j.Replicate.Validate(ctx, j, o)
@@ -1796,6 +1836,15 @@ func (a adminAPIHandlers) StartBatchJob(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Normalize the declared priority (lowercase); empty stays empty so
+	// the per-type server default is resolved at admission time.
+	priority, err := normalizeBatchPriority(job.Priority)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	job.Priority = string(priority)
+
 	job.ID = fmt.Sprintf("%s-%s%s%d", job.Type(), shortuuid.New(), getKeySeparator(), GetProxyEndpointLocalIndex(globalProxyEndpoints))
 	job.User = user
 	job.Started = time.Now()
@@ -1857,45 +1906,82 @@ func (a adminAPIHandlers) CancelBatchJob(w http.ResponseWriter, r *http.Request)
 	writeSuccessNoContent(w)
 }
 
-//msgp:ignore BatchJobPool
+// PauseBatchJob pauses a running batch job (stops picking new work, keeps
+// the progress marker) or freezes a queued job.
+func (a adminAPIHandlers) PauseBatchJob(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 
-// BatchJobPool batch job pool
-type BatchJobPool struct {
-	ctx          context.Context
-	objLayer     ObjectLayer
-	once         sync.Once
-	mu           sync.Mutex
-	jobCh        chan *BatchJobRequest
-	jmu          sync.Mutex // protects jobCancelers
-	jobCancelers map[string]context.CancelFunc
-	workerKillCh chan struct{}
-	workerSize   int
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.CancelBatchJobAction)
+	if objectAPI == nil {
+		return
+	}
+
+	jobID := r.Form.Get("id")
+	if jobID == "" {
+		writeErrorResponseJSON(ctx, w, toAPIError(ctx, errInvalidArgument), r.URL)
+		return
+	}
+
+	if _, proxied, _ := proxyRequestByToken(ctx, w, r, jobID, true); proxied {
+		return
+	}
+
+	if err := globalBatchJobPool.pauseJob(jobID); err != nil {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrInvalidRequest, err), r.URL)
+		return
+	}
+
+	writeSuccessNoContent(w)
 }
 
-var globalBatchJobPool *BatchJobPool
+// ResumeBatchJob resumes a paused batch job; a job paused while running is
+// re-queued and continues from its persisted progress marker.
+func (a adminAPIHandlers) ResumeBatchJob(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 
-// newBatchJobPool creates a pool of job manifest workers of specified size
-func newBatchJobPool(ctx context.Context, o ObjectLayer, workers int) *BatchJobPool {
-	jpool := &BatchJobPool{
-		ctx:          ctx,
-		objLayer:     o,
-		jobCh:        make(chan *BatchJobRequest, 10000),
-		workerKillCh: make(chan struct{}, workers),
-		jobCancelers: make(map[string]context.CancelFunc),
-	}
-	jpool.ResizeWorkers(workers)
-
-	randomWait := func() time.Duration {
-		// randomWait depends on the number of nodes to avoid triggering resume and cleanups at the same time.
-		return time.Duration(rand.Float64() * float64(time.Duration(globalEndpoints.NEndpoints())*time.Hour))
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.CancelBatchJobAction)
+	if objectAPI == nil {
+		return
 	}
 
-	go func() {
-		jpool.resume(randomWait)
-		jpool.cleanupReports(randomWait)
-	}()
+	jobID := r.Form.Get("id")
+	if jobID == "" {
+		writeErrorResponseJSON(ctx, w, toAPIError(ctx, errInvalidArgument), r.URL)
+		return
+	}
 
-	return jpool
+	if _, proxied, _ := proxyRequestByToken(ctx, w, r, jobID, true); proxied {
+		return
+	}
+
+	if err := globalBatchJobPool.resumeJob(jobID); err != nil {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErrWithErr(ErrInvalidRequest, err), r.URL)
+		return
+	}
+
+	writeSuccessNoContent(w)
+}
+
+// ListBatchJobQueue returns the node-local admission queue snapshot: job
+// states, queue positions/wait times, per-type occupancy and resource
+// watermarks. With an "id" argument the request is proxied to the node that
+// owns the job.
+func (a adminAPIHandlers) ListBatchJobQueue(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, policy.ListBatchJobsAction)
+	if objectAPI == nil {
+		return
+	}
+
+	if jobID := r.Form.Get("id"); jobID != "" {
+		if _, proxied, _ := proxyRequestByToken(ctx, w, r, jobID, true); proxied {
+			return
+		}
+	}
+
+	snapshot := globalBatchJobPool.queueSnapshot(r.Form.Get("jobType"))
+	batchLogIf(ctx, json.NewEncoder(w).Encode(&snapshot))
 }
 
 func (j *BatchJobPool) cleanupReports(randomWait func() time.Duration) {
@@ -1972,121 +2058,6 @@ func (j *BatchJobPool) resume(randomWait func() time.Duration) {
 			continue
 		}
 	}
-}
-
-// AddWorker adds a replication worker to the pool
-func (j *BatchJobPool) AddWorker() {
-	if j == nil {
-		return
-	}
-	for {
-		select {
-		case <-j.ctx.Done():
-			return
-		case job, ok := <-j.jobCh:
-			if !ok {
-				return
-			}
-			switch {
-			case job.Replicate != nil:
-				if job.Replicate.RemoteToLocal() {
-					if err := job.Replicate.StartFromSource(job.ctx, j.objLayer, *job); err != nil {
-						if !isErrBucketNotFound(err) {
-							batchLogIf(j.ctx, err)
-							j.canceler(job.ID, false)
-							continue
-						}
-						// Bucket not found proceed to delete such a job.
-					}
-				} else {
-					if err := job.Replicate.Start(job.ctx, j.objLayer, *job); err != nil {
-						if !isErrBucketNotFound(err) {
-							batchLogIf(j.ctx, err)
-							j.canceler(job.ID, false)
-							continue
-						}
-						// Bucket not found proceed to delete such a job.
-					}
-				}
-			case job.KeyRotate != nil:
-				if err := job.KeyRotate.Start(job.ctx, j.objLayer, *job); err != nil {
-					if !isErrBucketNotFound(err) {
-						batchLogIf(j.ctx, err)
-						continue
-					}
-				}
-			case job.Expire != nil:
-				if err := job.Expire.Start(job.ctx, j.objLayer, *job); err != nil {
-					if !isErrBucketNotFound(err) {
-						batchLogIf(j.ctx, err)
-						continue
-					}
-				}
-			}
-			j.canceler(job.ID, false)
-		case <-j.workerKillCh:
-			return
-		}
-	}
-}
-
-// ResizeWorkers sets replication workers pool to new size
-func (j *BatchJobPool) ResizeWorkers(n int) {
-	if j == nil {
-		return
-	}
-
-	j.mu.Lock()
-	defer j.mu.Unlock()
-
-	for j.workerSize < n {
-		j.workerSize++
-		go j.AddWorker()
-	}
-	for j.workerSize > n {
-		j.workerSize--
-		go func() { j.workerKillCh <- struct{}{} }()
-	}
-}
-
-func (j *BatchJobPool) queueJob(req *BatchJobRequest) error {
-	if j == nil {
-		return errInvalidArgument
-	}
-	jctx, jcancel := context.WithCancel(j.ctx)
-	j.jmu.Lock()
-	j.jobCancelers[req.ID] = jcancel
-	j.jmu.Unlock()
-	req.ctx = jctx
-
-	select {
-	case <-j.ctx.Done():
-		j.once.Do(func() {
-			xioutil.SafeClose(j.jobCh)
-		})
-	case j.jobCh <- req:
-	default:
-		return fmt.Errorf("batch job queue is currently full please try again later %#v", req)
-	}
-	return nil
-}
-
-// delete canceler from the map, cancel job if requested
-func (j *BatchJobPool) canceler(jobID string, cancel bool) error {
-	if j == nil {
-		return errInvalidArgument
-	}
-	j.jmu.Lock()
-	defer j.jmu.Unlock()
-	if canceler, ok := j.jobCancelers[jobID]; ok {
-		if cancel {
-			canceler()
-		}
-	}
-	if cancel {
-		delete(j.jobCancelers, jobID)
-	}
-	return nil
 }
 
 //msgp:ignore batchJobMetrics
@@ -2263,6 +2234,19 @@ func (m *batchJobMetrics) save(jobID string, ri *batchJobInfo) {
 	defer m.Unlock()
 
 	m.metrics[jobID] = ri.clone()
+}
+
+// flushJobProgress force-persists the latest in-memory progress snapshot
+// of a job to its report path; used when a job is paused so its marker
+// survives across the pause/resume boundary.
+func (m *batchJobMetrics) flushJobProgress(ctx context.Context, api ObjectLayer, job BatchJobRequest) {
+	m.RLock()
+	ri := m.metrics[job.ID]
+	m.RUnlock()
+	if ri == nil {
+		return
+	}
+	batchLogIf(ctx, ri.updateAfter(ctx, api, 0, job))
 }
 
 type objTraceInfoer interface {

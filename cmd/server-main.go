@@ -1129,12 +1129,24 @@ func serverMain(ctx *cli.Context) {
 
 		// Initialize batch job pool.
 		bootstrapTrace("newBatchJobPool", func() {
-			globalBatchJobPool = newBatchJobPool(GlobalContext, newObject, 100)
+			// workers=0 makes the pool size itself from the batch
+			// subsystem config (max_jobs; defaults to 100).
+			globalBatchJobPool = newBatchJobPool(GlobalContext, newObject, 0)
 			globalBatchJobsMetrics = batchJobMetrics{
 				metrics: make(map[string]*batchJobInfo),
 			}
 			go globalBatchJobsMetrics.init(GlobalContext, newObject)
 			go globalBatchJobsMetrics.purgeJobMetrics()
+
+			// Start the resource watermark monitor feeding the admission
+			// gate; disabled thresholds make it a no-op.
+			wm := globalBatchConfig.Watermarks()
+			monitor := newBatchResourceMonitor(
+				GlobalContext, newObject, wm.CPU, wm.Mem, wm.Drive,
+				func() { globalBatchJobPool.scheduler.dispatch() },
+			)
+			globalBatchJobPool.monitor = monitor
+			go monitor.run()
 		})
 
 		// Prints the formatted startup message, if err is not nil then it prints additional information as well.

@@ -418,9 +418,20 @@ func (r *BatchJobKeyRotateV1) Start(ctx context.Context, api ObjectLayer, job Ba
 			if wait := globalBatchConfig.KeyRotationWait(); wait > 0 {
 				time.Sleep(wait)
 			}
+			if wait := batchResourceThrottleWait(); wait > 0 {
+				time.Sleep(wait)
+			}
 		}()
 	}
 	wk.Wait()
+
+	if cause := context.Cause(ctx); cause != nil {
+		// Job was paused/canceled while rotating keys: the walk only
+		// covered part of the namespace, so it must not be marked complete.
+		persistBatchJobOnInterruption(ctx, api, job, ri)
+		cancel()
+		return cause
+	}
 
 	ri.Complete = !failed && ri.ObjectsFailed == 0
 	ri.Failed = failed || ri.ObjectsFailed > 0
