@@ -149,6 +149,33 @@ func saveBackgroundHealInfo(ctx context.Context, objAPI ObjectLayer, info backgr
 	}
 }
 
+// loadScannerCycleInfo reads the persisted scanner cycle header, including the
+// lifecycle checkpoint (state/reason/position) of a paused or interrupted
+// cycle. The leading 8 bytes remain the raw next-cycle number for backward
+// compatibility.
+func loadScannerCycleInfo(ctx context.Context, objAPI ObjectLayer) (cycleInfo currentScannerCycle) {
+	buf, _ := readConfig(ctx, objAPI, dataUsageBloomNamePath)
+	switch {
+	case len(buf) == 8:
+		cycleInfo.next = binary.LittleEndian.Uint64(buf)
+	case len(buf) > 8:
+		cycleInfo.next = binary.LittleEndian.Uint64(buf[:8])
+		if _, err := cycleInfo.UnmarshalMsg(buf[8:]); err != nil {
+			bugLogIf(ctx, err)
+		}
+	}
+	return cycleInfo
+}
+
+// saveScannerCycleInfo persists the scanner cycle header.
+func saveScannerCycleInfo(ctx context.Context, objAPI ObjectLayer, cycleInfo *currentScannerCycle) error {
+	tmp := make([]byte, 8, 8+cycleInfo.Msgsize())
+	// Cycle for backward compat.
+	binary.LittleEndian.PutUint64(tmp, cycleInfo.next)
+	tmp, _ = cycleInfo.MarshalMsg(tmp)
+	return saveConfig(ctx, objAPI, dataUsageBloomNamePath, tmp)
+}
+
 // runDataScanner will start a data scanner.
 // The function will block until the context is canceled.
 // There should only ever be one scanner running per cluster.
@@ -156,18 +183,9 @@ func runDataScanner(ctx context.Context, objAPI ObjectLayer) {
 	ctx, cancel := globalLeaderLock.GetLock(ctx)
 	defer cancel()
 
-	// Load current bloom cycle
-	var cycleInfo currentScannerCycle
-
-	buf, _ := readConfig(ctx, objAPI, dataUsageBloomNamePath)
-	if len(buf) == 8 {
-		cycleInfo.next = binary.LittleEndian.Uint64(buf)
-	} else if len(buf) > 8 {
-		cycleInfo.next = binary.LittleEndian.Uint64(buf[:8])
-		buf = buf[8:]
-		_, err := cycleInfo.UnmarshalMsg(buf)
-		bugLogIf(ctx, err)
-	}
+	// Load current bloom cycle and the checkpoint of any interrupted attempt.
+	cycleInfo := loadScannerCycleInfo(ctx, objAPI)
+	globalScannerLifecycle.bootstrap(cycleInfo.cycleCompleted)
 
 	scannerTimer := time.NewTimer(scannerCycle.Load())
 	defer scannerTimer.Stop()
@@ -185,6 +203,11 @@ func runDataScanner(ctx context.Context, objAPI ObjectLayer) {
 			stopFn := globalScannerMetrics.log(scannerMetricScanCycle)
 			cycleInfo.current = cycleInfo.next
 			cycleInfo.started = time.Now()
+			// A paused or previously interrupted cycle is resumed with the
+			// same number; per-bucket checkpoints let the scan skip batches
+			// that already completed in an earlier attempt.
+			resuming := cycleInfo.state == scannerCycleStatePaused ||
+				cycleInfo.state == scannerCycleStateInterrupted
 			globalScannerMetrics.setCycle(&cycleInfo)
 
 			bgHealInfo := readBackgroundHealInfo(ctx, objAPI)
@@ -200,33 +223,97 @@ func runDataScanner(ctx context.Context, objAPI ObjectLayer) {
 			}
 
 			// Wait before starting next cycle and wait on startup.
-			results := make(chan DataUsageInfo, 1)
-			go storeDataUsageInBackend(ctx, objAPI, results)
+			results := make(chan dataUsageInfoUpdate, 1)
+			storeDone := make(chan struct{})
+			go func() {
+				defer close(storeDone)
+				storeDataUsageInBackend(ctx, objAPI, results)
+			}()
+
+			globalScannerLifecycle.beginCycle(cycleInfo.current, cycleInfo.started, resuming)
+			// When the running cycle actually reaches a pause boundary,
+			// durably record the checkpoint so a restart or leader change
+			// resumes the same paused cycle.
+			globalScannerLifecycle.setOnPaused(func(position string) {
+				cycleInfo.state = scannerCycleStatePaused
+				cycleInfo.position = position
+				cycleInfo.reason = globalScannerLifecycle.interruptionReason()
+				cycleInfo.interruptedAt = time.Now()
+				globalScannerMetrics.setCycle(&cycleInfo)
+				if err := saveScannerCycleInfo(ctx, objAPI, &cycleInfo); err != nil {
+					scannerLogIf(ctx, fmt.Errorf("%w, Object %s", err, dataUsageBloomNamePath))
+				}
+			})
+
 			err := objAPI.NSScanner(ctx, results, uint32(cycleInfo.current), scanMode)
-			scannerLogIf(ctx, err)
+			globalScannerLifecycle.setOnPaused(nil)
+
 			res := map[string]string{"cycle": strconv.FormatUint(cycleInfo.current, 10)}
 			if err != nil {
 				res["error"] = err.Error()
+				if !errors.Is(err, errScannerCycleStopped) {
+					scannerLogIf(ctx, err)
+				}
 			}
-			stopFn(res)
+
+			// Wait for the backend writer to drain (stage or publish) the
+			// last update before deciding the cycle outcome. NSScanner
+			// already closes the channel on return, hence SafeClose.
+			xioutil.SafeClose(results)
+			<-storeDone
+
 			if err == nil {
-				// Store new cycle...
+				// A full round returned without errors: the cycle completes
+				// and its number advances.
+				completedAt := time.Now()
 				cycleInfo.next++
 				cycleInfo.current = 0
-				cycleInfo.cycleCompleted = append(cycleInfo.cycleCompleted, time.Now())
+				cycleInfo.state = scannerCycleStateNone
+				cycleInfo.reason = ""
+				cycleInfo.position = ""
+				cycleInfo.interruptedAt = time.Time{}
+				cycleInfo.cycleCompleted = append(cycleInfo.cycleCompleted, completedAt)
 				if len(cycleInfo.cycleCompleted) > dataUsageUpdateDirCycles {
 					cycleInfo.cycleCompleted = cycleInfo.cycleCompleted[len(cycleInfo.cycleCompleted)-dataUsageUpdateDirCycles:]
 				}
+				globalScannerLifecycle.finishCycle(true, completedAt, "", "")
 				globalScannerMetrics.setCycle(&cycleInfo)
-				tmp := make([]byte, 8, 8+cycleInfo.Msgsize())
-				// Cycle for backward compat.
-				binary.LittleEndian.PutUint64(tmp, cycleInfo.next)
-				tmp, _ = cycleInfo.MarshalMsg(tmp)
-				err = saveConfig(ctx, objAPI, dataUsageBloomNamePath, tmp)
-				if err != nil {
+				if err = saveScannerCycleInfo(ctx, objAPI, &cycleInfo); err != nil {
 					scannerLogIf(ctx, fmt.Errorf("%w, Object %s", err, dataUsageBloomNamePath))
 				}
+				stopFn(res)
+				continue
 			}
+
+			// The cycle was interrupted (external termination, leader loss
+			// or a scan error): keep the number unchanged and record where
+			// and why it stopped so the next attempt resumes this cycle.
+			reason := globalScannerLifecycle.interruptionReason()
+			if reason == "" {
+				reason = err.Error()
+			}
+			position := globalScannerLifecycle.Status().Position
+			if paths := globalScannerMetrics.getCurrentPaths(); len(paths) > 0 {
+				if position != "" {
+					position += "; "
+				}
+				position += strings.Join(paths, "; ")
+			}
+			interruptedAt := time.Now()
+			cycleInfo.state = scannerCycleStateInterrupted
+			cycleInfo.reason = reason
+			cycleInfo.position = position
+			cycleInfo.interruptedAt = interruptedAt
+			globalScannerLifecycle.finishCycle(false, interruptedAt, reason, position)
+			globalScannerMetrics.setCycle(&cycleInfo)
+			if perr := saveScannerCycleInfo(ctx, objAPI, &cycleInfo); perr != nil {
+				scannerLogIf(ctx, fmt.Errorf("%w, Object %s", perr, dataUsageBloomNamePath))
+			}
+			res["interrupted"] = reason
+			if position != "" {
+				res["position"] = position
+			}
+			stopFn(res)
 		}
 	}
 }
@@ -411,6 +498,12 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 		case <-done:
 			return ctx.Err()
 		default:
+		}
+		// Directory boundary: a pause request parks the scan here, after
+		// the previous directory fully completed, without discarding any
+		// usage collected so far; a termination unwinds from here as well.
+		if err := globalScannerLifecycle.waitAtFolderBoundary(ctx, folder.name); err != nil {
+			return err
 		}
 		var abandonedChildren dataUsageHashMap
 		if !into.Compacted {

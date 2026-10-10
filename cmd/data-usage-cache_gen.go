@@ -285,9 +285,9 @@ func (z *allTierStats) Msgsize() (s int) {
 // MarshalMsg implements msgp.Marshaler
 func (z *currentScannerCycle) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 4
+	// map header, size 8
 	// string "current"
-	o = append(o, 0x84, 0xa7, 0x63, 0x75, 0x72, 0x72, 0x65, 0x6e, 0x74)
+	o = append(o, 0x88, 0xa7, 0x63, 0x75, 0x72, 0x72, 0x65, 0x6e, 0x74)
 	o = msgp.AppendUint64(o, z.current)
 	// string "next"
 	o = append(o, 0xa4, 0x6e, 0x65, 0x78, 0x74)
@@ -301,6 +301,18 @@ func (z *currentScannerCycle) MarshalMsg(b []byte) (o []byte, err error) {
 	for za0001 := range z.cycleCompleted {
 		o = msgp.AppendTime(o, z.cycleCompleted[za0001])
 	}
+	// string "st"
+	o = append(o, 0xa2, 0x73, 0x74)
+	o = msgp.AppendString(o, z.state)
+	// string "rsn"
+	o = append(o, 0xa3, 0x72, 0x73, 0x6e)
+	o = msgp.AppendString(o, z.reason)
+	// string "pos"
+	o = append(o, 0xa3, 0x70, 0x6f, 0x73)
+	o = msgp.AppendString(o, z.position)
+	// string "ia"
+	o = append(o, 0xa2, 0x69, 0x61)
+	o = msgp.AppendTime(o, z.interruptedAt)
 	return
 }
 
@@ -359,6 +371,30 @@ func (z *currentScannerCycle) UnmarshalMsg(bts []byte) (o []byte, err error) {
 					return
 				}
 			}
+		case "st":
+			z.state, bts, err = msgp.ReadStringBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "state")
+				return
+			}
+		case "rsn":
+			z.reason, bts, err = msgp.ReadStringBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "reason")
+				return
+			}
+		case "pos":
+			z.position, bts, err = msgp.ReadStringBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "position")
+				return
+			}
+		case "ia":
+			z.interruptedAt, bts, err = msgp.ReadTimeBytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "interruptedAt")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -373,7 +409,9 @@ func (z *currentScannerCycle) UnmarshalMsg(bts []byte) (o []byte, err error) {
 
 // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
 func (z *currentScannerCycle) Msgsize() (s int) {
-	s = 1 + 8 + msgp.Uint64Size + 5 + msgp.Uint64Size + 8 + msgp.TimeSize + 15 + msgp.ArrayHeaderSize + (len(z.cycleCompleted) * (msgp.TimeSize))
+	s = 1 + 8 + msgp.Uint64Size + 5 + msgp.Uint64Size + 8 + msgp.TimeSize + 15 + msgp.ArrayHeaderSize + (len(z.cycleCompleted) * (msgp.TimeSize)) +
+		3 + msgp.StringPrefixSize + len(z.state) + 4 + msgp.StringPrefixSize + len(z.reason) +
+		4 + msgp.StringPrefixSize + len(z.position) + 3 + msgp.TimeSize
 	return
 }
 
@@ -621,6 +659,12 @@ func (z *dataUsageCacheInfo) DecodeMsg(dc *msgp.Reader) (err error) {
 				err = msgp.WrapError(err, "SkipHealing")
 				return
 			}
+		case "lsc":
+			z.LastScanCycle, err = dc.ReadUint32()
+			if err != nil {
+				err = msgp.WrapError(err, "LastScanCycle")
+				return
+			}
 		default:
 			err = dc.Skip()
 			if err != nil {
@@ -634,9 +678,9 @@ func (z *dataUsageCacheInfo) DecodeMsg(dc *msgp.Reader) (err error) {
 
 // EncodeMsg implements msgp.Encodable
 func (z *dataUsageCacheInfo) EncodeMsg(en *msgp.Writer) (err error) {
-	// map header, size 4
+	// map header, size 5
 	// write "Name"
-	err = en.Append(0x84, 0xa4, 0x4e, 0x61, 0x6d, 0x65)
+	err = en.Append(0x85, 0xa4, 0x4e, 0x61, 0x6d, 0x65)
 	if err != nil {
 		return
 	}
@@ -675,15 +719,25 @@ func (z *dataUsageCacheInfo) EncodeMsg(en *msgp.Writer) (err error) {
 		err = msgp.WrapError(err, "SkipHealing")
 		return
 	}
+	// write "lsc"
+	err = en.Append(0xa3, 0x6c, 0x73, 0x63)
+	if err != nil {
+		return
+	}
+	err = en.WriteUint32(z.LastScanCycle)
+	if err != nil {
+		err = msgp.WrapError(err, "LastScanCycle")
+		return
+	}
 	return
 }
 
 // MarshalMsg implements msgp.Marshaler
 func (z *dataUsageCacheInfo) MarshalMsg(b []byte) (o []byte, err error) {
 	o = msgp.Require(b, z.Msgsize())
-	// map header, size 4
+	// map header, size 5
 	// string "Name"
-	o = append(o, 0x84, 0xa4, 0x4e, 0x61, 0x6d, 0x65)
+	o = append(o, 0x85, 0xa4, 0x4e, 0x61, 0x6d, 0x65)
 	o = msgp.AppendString(o, z.Name)
 	// string "NextCycle"
 	o = append(o, 0xa9, 0x4e, 0x65, 0x78, 0x74, 0x43, 0x79, 0x63, 0x6c, 0x65)
@@ -694,6 +748,9 @@ func (z *dataUsageCacheInfo) MarshalMsg(b []byte) (o []byte, err error) {
 	// string "SkipHealing"
 	o = append(o, 0xab, 0x53, 0x6b, 0x69, 0x70, 0x48, 0x65, 0x61, 0x6c, 0x69, 0x6e, 0x67)
 	o = msgp.AppendBool(o, z.SkipHealing)
+	// string "lsc"
+	o = append(o, 0xa3, 0x6c, 0x73, 0x63)
+	o = msgp.AppendUint32(o, z.LastScanCycle)
 	return
 }
 
@@ -739,6 +796,12 @@ func (z *dataUsageCacheInfo) UnmarshalMsg(bts []byte) (o []byte, err error) {
 				err = msgp.WrapError(err, "SkipHealing")
 				return
 			}
+		case "lsc":
+			z.LastScanCycle, bts, err = msgp.ReadUint32Bytes(bts)
+			if err != nil {
+				err = msgp.WrapError(err, "LastScanCycle")
+				return
+			}
 		default:
 			bts, err = msgp.Skip(bts)
 			if err != nil {
@@ -753,7 +816,7 @@ func (z *dataUsageCacheInfo) UnmarshalMsg(bts []byte) (o []byte, err error) {
 
 // Msgsize returns an upper bound estimate of the number of bytes occupied by the serialized message
 func (z *dataUsageCacheInfo) Msgsize() (s int) {
-	s = 1 + 5 + msgp.StringPrefixSize + len(z.Name) + 10 + msgp.Uint32Size + 11 + msgp.TimeSize + 12 + msgp.BoolSize
+	s = 1 + 5 + msgp.StringPrefixSize + len(z.Name) + 10 + msgp.Uint32Size + 11 + msgp.TimeSize + 12 + msgp.BoolSize + 4 + msgp.Uint32Size
 	return
 }
 

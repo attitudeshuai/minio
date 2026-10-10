@@ -260,6 +260,13 @@ type dataUsageCacheInfo struct {
 	// should skip healing the disk
 	SkipHealing bool
 
+	// LastScanCycle records the cycle number in which the bucket completed a
+	// full scan. It is set only after the bucket finishes scanning cleanly
+	// and serves as a per-bucket resume checkpoint: an interrupted cycle is
+	// continued with the same number, so buckets carrying that number are
+	// not rescanned. A new (incremented) cycle never matches the marker.
+	LastScanCycle uint32
+
 	// Active lifecycle, if any on the bucket
 	lifeCycle *lifecycle.Lifecycle `msg:"-"`
 
@@ -1314,6 +1321,15 @@ type currentScannerCycle struct {
 	next           uint64
 	started        time.Time
 	cycleCompleted []time.Time
+
+	// Lifecycle checkpoint of an attempt that did not complete.
+	// state is one of scannerCycleState* constants. An empty state means the
+	// last cycle completed normally; "paused"/"interrupted" mean the number
+	// in "next" was not advanced and the next attempt resumes that cycle.
+	state         string
+	reason        string
+	position      string
+	interruptedAt time.Time
 }
 
 // clone returns a clone.

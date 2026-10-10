@@ -36,19 +36,46 @@ const (
 	dataUsageBloomName     = ".bloomcycle.bin"
 	dataUsageBloomNamePath = bucketMetaPrefix + SlashSeparator + dataUsageBloomName
 
+	// dataUsagePartialObjName holds the in-progress result of the current
+	// cycle. Readers never look at it: they only see the main object, which
+	// is replaced atomically when a full cycle completes. This guarantees
+	// that usage reads, including while a cycle is paused or resuming,
+	// return the result of some complete cycle instead of half-updated data.
+	dataUsagePartialObjName     = ".usage.json.partial"
+	dataUsagePartialObjNamePath = bucketMetaPrefix + SlashSeparator + dataUsagePartialObjName
+
 	backgroundHealInfoPath = bucketMetaPrefix + SlashSeparator + ".background-heal.json"
 
 	dataUsageCacheName = ".usage-cache.bin"
 )
 
+// dataUsageInfoUpdate carries a data usage result from the scanner to the
+// backend writer. Final marks the last update of a successfully completed
+// cycle; only final updates are published to the readable usage object, all
+// other updates are staged without affecting readers.
+type dataUsageInfoUpdate struct {
+	info  DataUsageInfo
+	final bool
+}
+
 // storeDataUsageInBackend will store all objects sent on the dui channel until closed.
-func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, dui <-chan DataUsageInfo) {
+// Partial cycle results are written to the staging object and never become
+// visible; the final result of each completed cycle is published to the main
+// object (keeping a backup every 10th completed cycle).
+func storeDataUsageInBackend(ctx context.Context, objAPI ObjectLayer, dui <-chan dataUsageInfoUpdate) {
 	attempts := 1
-	for dataUsageInfo := range dui {
+	for update := range dui {
 		json := jsoniter.ConfigCompatibleWithStandardLibrary
-		dataUsageJSON, err := json.Marshal(dataUsageInfo)
+		dataUsageJSON, err := json.Marshal(update.info)
 		if err != nil {
 			scannerLogIf(ctx, err)
+			continue
+		}
+		if !update.final {
+			// Stage the partial round without touching the published result.
+			if err = saveConfig(ctx, objAPI, dataUsagePartialObjNamePath, dataUsageJSON); err != nil {
+				scannerLogOnceIf(ctx, err, dataUsagePartialObjNamePath)
+			}
 			continue
 		}
 		if attempts > 10 {

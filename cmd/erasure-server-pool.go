@@ -732,7 +732,7 @@ func (z *erasureServerPools) StorageInfo(ctx context.Context, metrics bool) Stor
 	return globalNotificationSys.StorageInfo(ctx, z, metrics)
 }
 
-func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataUsageInfo, wantCycle uint32, healScanMode madmin.HealScanMode) error {
+func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- dataUsageInfoUpdate, wantCycle uint32, healScanMode madmin.HealScanMode) error {
 	// Updates must be closed before we return.
 	defer xioutil.SafeClose(updates)
 
@@ -750,7 +750,8 @@ func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataU
 	}
 
 	if len(allBuckets) == 0 {
-		updates <- DataUsageInfo{} // no buckets found update data usage to reflect latest state
+		// No buckets: this is a complete (empty) round, publish it.
+		updates <- dataUsageInfoUpdate{info: DataUsageInfo{}, final: true}
 		return nil
 	}
 	totalResults := 0
@@ -779,7 +780,9 @@ func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataU
 				// Start scanner. Blocks until done.
 				err := erObj.nsScanner(ctx, allBuckets, wantCycle, updates, healScanMode)
 				if err != nil {
-					scannerLogIf(ctx, err)
+					if !errors.Is(err, errScannerCycleStopped) {
+						scannerLogIf(ctx, err)
+					}
 					mu.Lock()
 					if firstErr == nil {
 						firstErr = err
@@ -802,7 +805,7 @@ func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataU
 		// Therefore to get the exact bucket sizes we must merge before we can convert.
 		var allMerged dataUsageCache
 
-		update := func() {
+		update := func(final bool) {
 			mu.Lock()
 			defer mu.Unlock()
 
@@ -815,7 +818,13 @@ func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataU
 				allMerged.merge(info)
 			}
 			if allMerged.root() != nil && allMerged.Info.LastUpdate.After(lastUpdate) {
-				updates <- allMerged.dui(allMerged.Info.Name, allBuckets)
+				dui := allMerged.dui(allMerged.Info.Name, allBuckets)
+				// An interrupted round never publishes: readers must only
+				// observe a fully completed cycle.
+				if final && firstErr != nil {
+					return
+				}
+				updates <- dataUsageInfoUpdate{info: dui, final: final}
 				lastUpdate = allMerged.Info.LastUpdate
 			}
 		}
@@ -824,11 +833,16 @@ func (z *erasureServerPools) NSScanner(ctx context.Context, updates chan<- DataU
 			case <-ctx.Done():
 				return
 			case v := <-updateCloser:
-				update()
+				update(true)
 				xioutil.SafeClose(v)
 				return
 			case <-updateTicker.C:
-				update()
+				// While parked at a pause boundary do not publish half
+				// results; readers keep seeing the previous complete round.
+				if globalScannerLifecycle.isPaused() {
+					continue
+				}
+				update(false)
 			}
 		}
 	}()

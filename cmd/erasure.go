@@ -377,10 +377,17 @@ func (er erasureObjects) cleanupDeletedObjects(ctx context.Context) {
 
 // nsScanner will start scanning buckets and send updated totals as they are traversed.
 // Updates are sent on a regular basis and the caller *must* consume them.
+//
+// When the cycle is resumed after an interruption, buckets whose cache
+// carries LastScanCycle == wantCycle completed in an earlier attempt of the
+// same cycle and are skipped instead of being rescanned.
 func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wantCycle uint32, updates chan<- dataUsageCache, healScanMode madmin.HealScanMode) error {
 	if len(buckets) == 0 {
 		return nil
 	}
+
+	// Register the bucket batches of this set for progress reporting.
+	globalScannerLifecycle.addTotalBatches(len(buckets))
 
 	// Collect disks we can use.
 	disks, healing := er.getOnlineDisksWithHealing(false)
@@ -447,6 +454,12 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 		for {
 			select {
 			case <-t.C:
+				// While the cycle is parked at a pause boundary do not
+				// persist half-updated totals; readers keep seeing the
+				// result saved before the pause.
+				if globalScannerLifecycle.isPaused() {
+					continue
+				}
 				if cache.Info.LastUpdate.Equal(lastSave) {
 					continue
 				}
@@ -480,14 +493,38 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 	var wg sync.WaitGroup
 	wg.Add(len(disks))
 
+	// boundaryErr carries an external termination or context cancellation
+	// observed at a bucket/directory boundary so the interrupted cycle is
+	// not mistaken for a completed one.
+	var boundaryMu sync.Mutex
+	var boundaryErr error
+	setBoundaryErr := func(err error) {
+		if err == nil {
+			return
+		}
+		boundaryMu.Lock()
+		if boundaryErr == nil {
+			boundaryErr = err
+		}
+		boundaryMu.Unlock()
+	}
+
 	for i := range disks {
 		go func(i int) {
 			defer wg.Done()
 			disk := disks[i]
 
 			for bucket := range bucketCh {
+				// Bucket directory boundary: pause parks here, termination
+				// and leader loss unwind here without losing batches that
+				// already completed.
+				if err := globalScannerLifecycle.waitAtBucketBoundary(ctx, bucket.Name); err != nil {
+					setBoundaryErr(err)
+					return
+				}
 				select {
 				case <-ctx.Done():
+					setBoundaryErr(ctx.Err())
 					return
 				default:
 				}
@@ -508,6 +545,33 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 						NextCycle:  wantCycle,
 					}
 				}
+				// Resume checkpoint: a bucket carrying the current cycle
+				// number completed cleanly in an earlier attempt of the same
+				// cycle (process restart, leader change or pause/termination),
+				// so do not rescan it. A freshly incremented cycle never
+				// matches the marker, hence no explicit resume flag is needed.
+				// Its totals are replayed into the set root cache so a missing
+				// root entry cannot drop the bucket from the merged result.
+				if cache.Info.LastScanCycle == wantCycle {
+					if r := cache.root(); r != nil {
+						root := cache.flatten(*r)
+						select {
+						case <-ctx.Done():
+							setBoundaryErr(ctx.Err())
+							return
+						case bucketResults <- dataUsageEntryInfo{
+							Name:   cache.Info.Name,
+							Parent: dataUsageRoot,
+							Entry:  root,
+						}:
+						}
+						globalScannerLifecycle.completeBatch(bucket.Name)
+						continue
+					}
+					// Marker without usable data: rescan the bucket.
+				}
+				// Only a clean completion may mark the bucket checkpoint.
+				cache.Info.LastScanCycle = 0
 				// Collect updates.
 				updates := make(chan dataUsageEntry, 1)
 				var wg sync.WaitGroup
@@ -530,9 +594,12 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 				var err error
 				cache, err = disk.NSScanner(ctx, cache, updates, healScanMode, nil)
 				if err != nil {
+					// A partial bucket must never look like a completed
+					// batch on resume.
+					cache.Info.LastScanCycle = 0
 					if !cache.Info.LastUpdate.IsZero() && cache.Info.LastUpdate.After(before) {
 						scannerLogIf(ctx, cache.save(ctx, er, cacheName))
-					} else {
+					} else if !errors.Is(err, errScannerCycleStopped) && !contextCanceled(ctx) {
 						scannerLogIf(ctx, err)
 					}
 					// This ensures that we don't close
@@ -540,6 +607,10 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 					// updates-collector goroutine still
 					// holds a reference to this.
 					wg.Wait()
+					if errors.Is(err, errScannerCycleStopped) || contextCanceled(ctx) {
+						setBoundaryErr(err)
+						return
+					}
 					continue
 				}
 
@@ -551,6 +622,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 				}
 				select {
 				case <-ctx.Done():
+					setBoundaryErr(ctx.Err())
 					return
 				case bucketResults <- dataUsageEntryInfo{
 					Name:   cache.Info.Name,
@@ -559,8 +631,12 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 				}:
 				}
 
+				// Record the resume checkpoint only once the bucket finished
+				// cleanly, then persist the per-bucket cache.
+				cache.Info.LastScanCycle = wantCycle
 				// Save cache
 				scannerLogIf(ctx, cache.save(ctx, er, cacheName))
+				globalScannerLifecycle.completeBatch(bucket.Name)
 			}
 		}(i)
 	}
@@ -568,5 +644,8 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, wa
 	xioutil.SafeClose(bucketResults)
 	saverWg.Wait()
 
-	return nil
+	boundaryMu.Lock()
+	err := boundaryErr
+	boundaryMu.Unlock()
+	return err
 }
