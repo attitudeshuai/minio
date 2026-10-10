@@ -40,6 +40,8 @@ const (
 	Authorization      = "Authorization"
 	Action             = "Action"
 	Range              = "Range"
+	RateLimitLimit     = "X-RateLimit-Limit"
+	RateLimitRemaining = "X-RateLimit-Remaining"
 )
 
 // Non standard S3 HTTP response constants

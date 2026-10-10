@@ -327,6 +327,19 @@ func registerAdminRouter(router *mux.Router, enableConfigOps bool) {
 		adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-bucket-quota").HandlerFunc(
 			adminMiddleware(adminAPI.PutBucketQuotaConfigHandler)).Queries("bucket", "{bucket:.*}")
 
+		// Per-bucket/per-caller request admission rules.
+		// SetRequestAdmission
+		adminRouter.Methods(http.MethodPut).Path(adminVersion+"/set-request-admission").HandlerFunc(
+			adminMiddleware(adminAPI.SetRequestAdmissionHandler)).
+			Queries("scope", "{scope:.*}", "name", "{name:.*}")
+		// GetRequestAdmission (scope/name optional)
+		adminRouter.Methods(http.MethodGet).Path(adminVersion + "/get-request-admission").HandlerFunc(
+			adminMiddleware(adminAPI.GetRequestAdmissionHandler))
+		// DeleteRequestAdmission
+		adminRouter.Methods(http.MethodDelete).Path(adminVersion+"/delete-request-admission").HandlerFunc(
+			adminMiddleware(adminAPI.DeleteRequestAdmissionHandler)).
+			Queries("scope", "{scope:.*}", "name", "{name:.*}")
+
 		// Bucket replication operations
 		// GetBucketTargetHandler
 		adminRouter.Methods(http.MethodGet).Path(adminVersion+"/list-remote-targets").HandlerFunc(

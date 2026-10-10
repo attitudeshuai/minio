@@ -396,6 +396,12 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 			return true
 		}
 
+		// Admission runs only after authn+authz have both succeeded.
+		if s3Error := admitRequest(ctx, r, policy.GetObjectAction, bucket); s3Error != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+			return true
+		}
+
 		return checkPreconditions(ctx, w, r, oi, opts)
 	}
 
@@ -846,6 +852,13 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 
 	if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
 		writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
+		return
+	}
+
+	// Per-bucket/per-caller admission only after authn+authz succeeded.
+	// writeErrorResponse (not HeadersOnly) so Retry-After/X-RateLimit are set.
+	if s3Error := admitRequest(ctx, r, policy.GetObjectAction, bucket); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
 
@@ -1886,6 +1899,12 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	// Per-bucket/per-caller admission after authn+authz, before body handling.
+	if s3Err = admitRequest(ctx, r, policy.PutObjectAction, bucket); s3Err != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+		return
+	}
+
 	switch rAuthType {
 	case authTypeStreamingSigned, authTypeStreamingSignedTrailer:
 		// Initialize stream signature verifier.
@@ -2284,6 +2303,12 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 	}
 	// Check if put is allow for specified prefix.
 	if s3Err = isPutActionAllowed(ctx, rAuthType, bucket, opts.prefixAll, r, policy.PutObjectAction); s3Err != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+		return
+	}
+
+	// Per-bucket/per-caller admission after authn+authz.
+	if s3Err = admitRequest(ctx, r, policy.PutObjectAction, bucket); s3Err != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 		return
 	}
@@ -2931,6 +2956,12 @@ func (api objectAPIHandlers) PutObjectRetentionHandler(w http.ResponseWriter, r 
 		return
 	}
 
+	// Apply the per-bucket/per-caller admission layer before serving.
+	if s3Error := admitRequest(ctx, r, policy.PutObjectRetentionAction, bucket); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
 	if _, err := objectAPI.GetBucketInfo(ctx, bucket, BucketOptions{}); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -3147,6 +3178,12 @@ func (api objectAPIHandlers) GetObjectTaggingHandler(w http.ResponseWriter, r *h
 	}
 
 	if s3Error := authorizeRequest(ctx, r, policy.GetObjectTaggingAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
+	// Admission only after authn+authz succeeded.
+	if s3Error := admitRequest(ctx, r, policy.GetObjectTaggingAction, bucket); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}

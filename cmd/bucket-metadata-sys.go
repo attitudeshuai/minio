@@ -69,19 +69,29 @@ func (sys *BucketMetadataSys) Remove(buckets ...string) {
 		globalBucketMonitor.DeleteBucket(bucket)
 	}
 	sys.Unlock()
+	for _, bucket := range buckets {
+		globalAdmissionSys.notifyBucketDeleted(GlobalContext, bucket)
+	}
 }
 
 // RemoveStaleBuckets removes all stale buckets in memory that are not on disk.
 func (sys *BucketMetadataSys) RemoveStaleBuckets(diskBuckets set.StringSet) {
+	var removed []string
 	sys.Lock()
-	defer sys.Unlock()
-
 	for bucket := range sys.metadataMap {
 		if diskBuckets.Contains(bucket) {
 			continue
 		} // doesn't exist on disk remove from memory.
 		delete(sys.metadataMap, bucket)
 		globalBucketMonitor.DeleteBucket(bucket)
+		removed = append(removed, bucket)
+	}
+	sys.Unlock()
+
+	// Admission pruning rewrites the rules file: do it outside the metadata
+	// lock so a batch of stale buckets does not block bucket metadata reads.
+	for _, bucket := range removed {
+		globalAdmissionSys.notifyBucketDeleted(GlobalContext, bucket)
 	}
 }
 

@@ -1187,6 +1187,17 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		}
 	}
 
+	// POST policy uploads authenticate outside checkRequestAuthTypeCredential:
+	// populate the verified principal and apply the admission layer.
+	if reqInfo := logger.GetReqInfo(ctx); reqInfo != nil {
+		reqInfo.Cred = cred
+		reqInfo.BucketName = bucket
+	}
+	if s3Error := admitRequest(ctx, r, policy.PutObjectAction, bucket); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
 	policyBytes, err := base64.StdEncoding.DecodeString(formValues.Get("Policy"))
 	if err != nil {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrMalformedPOSTRequest), r.URL)

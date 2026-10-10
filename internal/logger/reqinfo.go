@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/minio/minio/internal/auth"
 )
@@ -61,6 +62,13 @@ type ReqInfo struct {
 	AuthType     string           `json:"-"`
 	tags         []KeyVal         // Any additional info not accommodated by above fields
 	sync.RWMutex
+
+	// Per-bucket/per-caller request admission decision, populated only when
+	// the admission layer rejects the request. Not serialized.
+	AdmissionRateLimited bool
+	AdmissionRetryAfter  time.Duration
+	AdmissionLimit       float64
+	AdmissionRemaining   int
 }
 
 // NewReqInfo :

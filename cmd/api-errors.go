@@ -451,6 +451,12 @@ const (
 
 	ErrIAMNotInitialized
 
+	// ErrAdmissionRateLimited is returned by the per-bucket/per-caller
+	// request admission layer when a request exceeds its configured rate
+	// (and its bounded queue wait). Distinct from ErrTooManyRequests which
+	// is returned by the node-wide in-flight request gate.
+	ErrAdmissionRateLimited
+
 	apiErrCodeEnd // This is used only for the testing code
 )
 
@@ -1511,6 +1517,11 @@ var errorCodes = errorCodeMap{
 	ErrTooManyRequests: {
 		Code:           "TooManyRequests",
 		Description:    "Please reduce your request rate",
+		HTTPStatusCode: http.StatusTooManyRequests,
+	},
+	ErrAdmissionRateLimited: {
+		Code:           "RequestRateLimited",
+		Description:    "Request rejected by bucket/caller request quota: reduce your request rate and retry after the Retry-After interval",
 		HTTPStatusCode: http.StatusTooManyRequests,
 	},
 	ErrUnsupportedMetadata: {

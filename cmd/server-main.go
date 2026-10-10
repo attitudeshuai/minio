@@ -1119,6 +1119,12 @@ func serverMain(ctx *cli.Context) {
 			globalSiteReplicationSys.Init(GlobalContext, newObject)
 		})
 
+		// Initialize per-bucket/per-caller request admission (loads rules,
+		// starts the cluster usage exchange and config-reload poller).
+		bootstrapTrace("startAdmissionSystem", func() {
+			startAdmissionSystem(GlobalContext)
+		})
+
 		// Populate existing buckets to the etcd backend
 		if globalDNSConfig != nil {
 			// Background this operation.

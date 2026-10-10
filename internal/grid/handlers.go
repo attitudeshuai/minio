@@ -116,6 +116,10 @@ const (
 	HandlerRenamePart
 	HandlerClearUploadID
 	HandlerCheckParts3
+	HandlerAdmissionExchange
+	HandlerAdmissionAllocate
+	HandlerAdmissionMutate
+	HandlerAdmissionReload
 
 	// Add more above here ^^^
 	// If all handlers are used, the type of Handler can be changed.
@@ -200,6 +204,10 @@ var handlerPrefixes = [handlerLast]string{
 	HandlerCheckParts3:                 storagePrefix,
 	HandlerRenamePart:                  storagePrefix,
 	HandlerClearUploadID:               peerPrefix,
+	HandlerAdmissionExchange:           peerPrefix,
+	HandlerAdmissionAllocate:           peerPrefix,
+	HandlerAdmissionMutate:             peerPrefix,
+	HandlerAdmissionReload:             peerPrefix,
 }
 
 const (

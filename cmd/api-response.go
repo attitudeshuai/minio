@@ -953,6 +953,9 @@ func writeSuccessResponseHeadersOnly(w http.ResponseWriter) {
 	writeResponse(w, http.StatusOK, nil, mimeNone)
 }
 
+// requestRateLimitedCode matches APIError.Code for ErrAdmissionRateLimited.
+const requestRateLimitedCode = "RequestRateLimited"
+
 // writeErrorResponse writes error headers
 func writeErrorResponse(ctx context.Context, w http.ResponseWriter, err APIError, reqURL *url.URL) {
 	switch err.HTTPStatusCode {
@@ -960,6 +963,22 @@ func writeErrorResponse(ctx context.Context, w http.ResponseWriter, err APIError
 		// Set retry-after header to indicate user-agents to retry request after 60 seconds.
 		// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After
 		w.Header().Set(xhttp.RetryAfter, "60")
+	}
+
+	// Per-bucket/per-caller admission rejections carry a decision-derived
+	// Retry-After and rate limit headers; override the generic 60s value.
+	if err.Code == requestRateLimitedCode {
+		if reqInfo := logger.GetReqInfo(ctx); reqInfo != nil && reqInfo.AdmissionRateLimited {
+			// Ceiling seconds. Note: Duration/Duration yields a Duration
+			// in nanoseconds, so the division must be done on int64s.
+			retrySecs := (int64(reqInfo.AdmissionRetryAfter) + int64(time.Second) - 1) / int64(time.Second)
+			if retrySecs < 1 {
+				retrySecs = 1
+			}
+			w.Header().Set(xhttp.RetryAfter, strconv.FormatInt(retrySecs, 10))
+			w.Header().Set(xhttp.RateLimitLimit, strconv.FormatFloat(reqInfo.AdmissionLimit, 'f', -1, 64))
+			w.Header().Set(xhttp.RateLimitRemaining, strconv.Itoa(reqInfo.AdmissionRemaining))
+		}
 	}
 
 	switch err.Code {

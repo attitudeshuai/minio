@@ -532,7 +532,13 @@ func checkRequestAuthTypeCredential(ctx context.Context, r *http.Request, action
 		return cred, owner, s3Err
 	}
 
-	return cred, owner, authorizeRequest(ctx, r, action)
+	if s3Err = authorizeRequest(ctx, r, action); s3Err != ErrNone {
+		return cred, owner, s3Err
+	}
+
+	// Authentication and authorization succeeded: apply the per-bucket and
+	// per-caller request admission layer before the request is handled.
+	return cred, owner, admitRequest(ctx, r, action, reqInfo.BucketName)
 }
 
 // Verify if request has valid AWS Signature Version '2'.

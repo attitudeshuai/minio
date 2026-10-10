@@ -676,6 +676,13 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 		return
 	}
 
+	// Per-bucket/per-caller admission after authn+authz. UploadPart counts
+	// as one write-class request against the same bucket/caller quotas.
+	if s3Error = admitRequest(ctx, r, policy.PutObjectAction, bucket); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
 	switch rAuthType {
 	case authTypeStreamingSigned, authTypeStreamingSignedTrailer:
 		// Initialize stream signature verifier.

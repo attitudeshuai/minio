@@ -32,6 +32,7 @@ import (
 	"github.com/shirou/gopsutil/v3/mem"
 
 	"github.com/minio/minio/internal/config/api"
+	xhttp "github.com/minio/minio/internal/http"
 	xioutil "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/mcontext"
@@ -337,8 +338,8 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 			tc.FuncName = "s3.MaxClients"
 		}
 
-		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(cap(pool)))
-		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(cap(pool)-len(pool)))
+		w.Header().Set(xhttp.RateLimitLimit, strconv.Itoa(cap(pool)))
+		w.Header().Set(xhttp.RateLimitRemaining, strconv.Itoa(cap(pool)-len(pool)))
 
 		ctx := r.Context()
 		select {

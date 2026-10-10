@@ -709,6 +709,11 @@ func (sys *IAMSys) DeleteUser(ctx context.Context, accessKey string, notifyPeers
 		return err
 	}
 
+	// Reclaim any per-caller request admission rule for this principal.
+	// This runs on both the origin and peers (the peer delete-user handler
+	// calls DeleteUser with notifyPeers=false).
+	globalAdmissionSys.notifyCallerDeleted(ctx, accessKey)
+
 	// Notify all other MinIO peers to delete user.
 	if notifyPeers && !sys.HasWatcher() {
 		for _, nerr := range globalNotificationSys.DeleteUser(ctx, accessKey) {
@@ -1377,6 +1382,9 @@ func (sys *IAMSys) DeleteServiceAccount(ctx context.Context, accessKey string, n
 	if err := sys.store.DeleteUser(ctx, accessKey, svcUser); err != nil {
 		return err
 	}
+
+	// Reclaim any per-caller request admission rule for this service account.
+	globalAdmissionSys.notifyCallerDeleted(ctx, accessKey)
 
 	if notifyPeers && !sys.HasWatcher() {
 		for _, nerr := range globalNotificationSys.DeleteServiceAccount(ctx, accessKey) {
